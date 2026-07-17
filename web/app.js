@@ -119,48 +119,82 @@ async function createAgent(devboxId){
 }
 
 // ---------------- terminal ----------------
+let reconnectDelay = 500, reconnectTimer = null, wantOpen = false;
+
 function setupTerm(){
   term = new Terminal({fontFamily:'Consolas,monospace',fontSize:13,cursorBlink:true,
-    theme:{background:'#000000'}});
+    scrollback:5000, theme:{background:'#000000'}});
   fit = new FitAddon.FitAddon(); term.loadAddon(fit);
   term.open(document.getElementById('term'));
   fit.fit();
   window.onresize = ()=>{ try{fit.fit(); sendResize();}catch(e){} };
-  term.onData(d => { if(termWS && curSession)
+  term.onData(d => { if(termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'input',session_id:curSession,data:d})); });
 }
 function sendResize(){
-  if(termWS && curSession) termWS.send(JSON.stringify(
+  if(termWS && termWS.readyState===1 && curSession) termWS.send(JSON.stringify(
     {type:'resize',session_id:curSession,cols:term.cols,rows:term.rows}));
 }
 
 async function openAgent(agentId, name){
+  // leaving previous session? detach it (do NOT kill its PTY)
+  if(termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'detach',session_id:curSession}));
   document.getElementById('termhead').innerHTML =
-    `<b>${name}</b> <span class="muted">— live terminal</span>`;
+    `<b>${name}</b> <span class="muted">— live terminal</span>
+     <span style="flex:1"></span>
+     <span id="stat" class="muted"></span>`;
   term.reset();
   const sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
   curSession = sess.id;
+  wantOpen = true;
   connectTermWS();
 }
 
+function setStat(txt, color){
+  const el = document.getElementById('stat');
+  if(el){ el.textContent = txt; el.style.color = color||'#8b949e'; }
+}
+
 function connectTermWS(){
-  if(termWS){ try{termWS.close();}catch(e){} }
+  if(termWS){ try{ wantOpen && (termWS.onclose=null); termWS.close(); }catch(e){} }
   const proto = location.protocol==='https:'?'wss':'ws';
   termWS = new WebSocket(`${proto}://${location.host}/ws/term`);
   termWS.onopen = ()=>{
-    termWS.send(JSON.stringify({type:'open',session_id:curSession}));
-    sendResize();
+    reconnectDelay = 500;
+    setStat('● live', '#3fb950');
+    termWS.send(JSON.stringify({type:'attach',session_id:curSession,
+      cols:term.cols,rows:term.rows}));
   };
   termWS.onmessage = (ev)=>{
     const f = JSON.parse(ev.data);
-    if(f.type==='output' && f.session_id===curSession) term.write(f.data);
-    else if(f.type==='exit' && f.session_id===curSession){
-      if(f.data) term.write(f.data);
-      term.write(`\r\n[session ended, code ${f.code}]\r\n`);
+    if(f.session_id && f.session_id!==curSession) return;
+    switch(f.type){
+      case 'restore':          // reconnect: instantly repaint current screen
+        term.reset(); term.write(f.data); break;
+      case 'output':
+        term.write(f.data); break;
+      case 'status':
+        if(f.state==='live') setStat('● live','#3fb950');
+        else if(f.state==='offline'){ setStat('● devbox offline','#d29922');
+          term.write('\r\n[devbox offline — the connector isn\'t running]\r\n'); }
+        else if(f.state==='ended'){ setStat('● ended','#8b949e');
+          term.write(`\r\n[session ended, code ${f.code}]\r\n`); }
+        break;
+      case 'exit':
+        setStat('● ended','#8b949e');
+        if(f.data) term.write(f.data);
+        term.write(`\r\n[session ended, code ${f.code}]\r\n`); break;
+      case 'error':
+        term.write(`\r\n[error] ${f.message}\r\n`); break;
     }
-    else if(f.type==='error') term.write(`\r\n[error] ${f.message}\r\n`);
   };
-  termWS.onclose = ()=>{ term.write('\r\n[disconnected]\r\n'); };
+  termWS.onclose = ()=>{
+    if(!wantOpen) return;
+    setStat('● reconnecting…','#d29922');
+    reconnectTimer = setTimeout(connectTermWS, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay*2, 5000);  // exponential backoff
+  };
 }
 
 // ---------------- start ----------------

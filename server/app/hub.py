@@ -69,6 +69,10 @@ class Hub:
         conn.sessions[session_id] = agent_id
         self.session_watchers.setdefault(session_id, set()).add(conn)
 
+    def unwatch(self, conn: HumanConn, session_id: str):
+        conn.sessions.pop(session_id, None)
+        self.session_watchers.get(session_id, set()).discard(conn)
+
     async def to_devbox(self, agent_id: str, frame: dict) -> bool:
         conn = self.devbox_for_agent(agent_id)
         if not conn:

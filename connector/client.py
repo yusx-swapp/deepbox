@@ -90,7 +90,7 @@ class Connector:
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
         if t == "open":
-            await self.open_pty(aid, sid)
+            await self.open_pty(aid, sid, frame.get("cols", 120), frame.get("rows", 30))
         elif t == "input":
             p = self.ptys.get((aid, sid))
             if p:
@@ -99,12 +99,12 @@ class Connector:
             p = self.ptys.get((aid, sid))
             if p:
                 p.resize(frame.get("cols", 80), frame.get("rows", 24))
-        elif t == "close":
+        elif t in ("close", "terminate"):
             p = self.ptys.pop((aid, sid), None)
             if p:
                 p.kill()
 
-    async def open_pty(self, agent_id: str, session_id: str):
+    async def open_pty(self, agent_id: str, session_id: str, cols: int = 120, rows: int = 30):
         key = (agent_id, session_id)
         if key in self.ptys:
             await self.send({"type": "ready", "agent_id": agent_id,
@@ -122,7 +122,7 @@ class Connector:
             await self.send({"type": "exit", "agent_id": agent_id,
                              "session_id": session_id, "code": code})
 
-        p = PtySession(cmd, info.get("cwd"), on_output, on_exit)
+        p = PtySession(cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows)
         try:
             await p.start()
         except Exception as e:

@@ -23,6 +23,7 @@ from .util import (
     new_id, new_token, hash_token, hash_password, verify_password,
 )
 from .hub import hub, DevboxConn, HumanConn
+from .live import live_registry
 
 SECRET = "dev-secret-change-me"
 signer = URLSafeSerializer(SECRET, salt="deepbox-session")
@@ -229,6 +230,22 @@ async def session_messages(session_id: str, request: Request, s: OrmSession = De
              "body": m.body, "created_at": m.created_at.isoformat()} for m in rows]
 
 
+@app.get("/api/sessions/{session_id}/recording")
+async def session_recording(session_id: str, request: Request, s: OrmSession = Depends(db)):
+    """Return the asciicast v2 DVR recording for replay/audit."""
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess or sess.user_id != u.id:
+        raise HTTPException(404, "not found")
+    from .live import DATA_DIR
+    from fastapi.responses import PlainTextResponse
+    path = DATA_DIR / f"{session_id}.cast"
+    if not path.exists():
+        raise HTTPException(404, "no recording")
+    return PlainTextResponse(path.read_text(encoding="utf-8"),
+                             media_type="application/x-asciicast")
+
+
 # ---------------------------------------------------------------- runtime REST (connector)
 @app.get("/api/me")
 async def me_devbox(request: Request, s: OrmSession = Depends(db)):
@@ -281,7 +298,22 @@ async def ws_devbox(ws: WebSocket):
         while True:
             frame = await ws.receive_json()
             t = frame.get("type")
-            if t in ("output", "ready", "exit", "presence"):
+            if t == "output":
+                sid = frame.get("session_id")
+                data = frame.get("data", "")
+                if sid:
+                    ls = live_registry.get(sid)
+                    if ls:
+                        ls.feed_output(data)      # update screen + DVR record
+                    await hub.to_session_humans(sid, frame)  # live broadcast
+            elif t == "exit":
+                sid = frame.get("session_id")
+                if sid:
+                    ls = live_registry.get(sid)
+                    if ls:
+                        ls.mark_ended(frame.get("code"))
+                    await hub.to_session_humans(sid, frame)
+            elif t in ("ready", "presence"):
                 sid = frame.get("session_id")
                 if sid:
                     await hub.to_session_humans(sid, frame)
@@ -325,27 +357,67 @@ async def ws_term(ws: WebSocket):
         while True:
             frame = await ws.receive_json()
             t = frame.get("type")
-            if t == "open":
-                # {type:open, session_id}
+            if t in ("attach", "open"):  # 'open' kept for back-compat
                 sess = s.get(Session, frame["session_id"])
                 if not sess or sess.user_id != uid:
                     await ws.send_json({"type": "error", "message": "no such session"})
                     continue
+                cols = frame.get("cols", 120)
+                rows = frame.get("rows", 30)
+                # ensure a LiveSession exists (rebuilds screen from .cast if server restarted)
+                ls = live_registry.get_or_create(sess.id, cols, rows)
+                ls.subscribers.add(conn)
                 hub.watch(conn, sess.id, sess.agent_id)
+                # 1) instantly restore the current screen for this viewer
+                await ws.send_json({"type": "restore", "session_id": sess.id,
+                                    "data": ls.restore_bytes()})
+                if ls.ended:
+                    await ws.send_json({"type": "status", "session_id": sess.id,
+                                        "state": "ended", "code": ls.exit_code})
+                    continue
+                # 2) ask the connector to ensure the PTY is alive (idempotent)
                 ok = await hub.to_devbox(sess.agent_id, {
-                    "type": "open", "agent_id": sess.agent_id, "session_id": sess.id})
-                if not ok:
-                    await ws.send_json({"type": "exit", "session_id": sess.id,
-                                        "code": -1,
-                                        "data": "\r\n[devbox offline]\r\n"})
-            elif t in ("input", "resize", "close"):
-                agent_id = conn.sessions.get(frame.get("session_id"))
+                    "type": "open", "agent_id": sess.agent_id,
+                    "session_id": sess.id, "cols": cols, "rows": rows})
+                await ws.send_json({"type": "status", "session_id": sess.id,
+                                    "state": "live" if ok else "offline"})
+            elif t == "input":
+                sid = frame.get("session_id")
+                agent_id = conn.sessions.get(sid)
                 if agent_id:
+                    ls = live_registry.get(sid)
+                    if ls:
+                        ls.record_input(frame.get("data", ""))
                     frame["agent_id"] = agent_id
                     await hub.to_devbox(agent_id, frame)
+            elif t == "resize":
+                sid = frame.get("session_id")
+                agent_id = conn.sessions.get(sid)
+                if agent_id:
+                    ls = live_registry.get(sid)
+                    if ls:
+                        ls.resize(frame.get("cols", 120), frame.get("rows", 30))
+                    frame["agent_id"] = agent_id
+                    await hub.to_devbox(agent_id, frame)
+            elif t in ("detach", "close"):  # viewer leaves; PTY keeps running
+                sid = frame.get("session_id")
+                ls = live_registry.get(sid)
+                if ls:
+                    ls.subscribers.discard(conn)
+                hub.unwatch(conn, sid)
+            elif t == "terminate":  # explicitly end the session (kill the CLI)
+                sid = frame.get("session_id")
+                agent_id = conn.sessions.get(sid)
+                if agent_id:
+                    await hub.to_devbox(agent_id, {
+                        "type": "terminate", "agent_id": agent_id, "session_id": sid})
     except WebSocketDisconnect:
         pass
     finally:
+        for sid in list(conn.sessions):
+            ls = live_registry.get(sid)
+            if ls:
+                ls.subscribers.discard(conn)
         hub.remove_human(conn)
         s.close()
 

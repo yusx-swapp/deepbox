@@ -8,6 +8,7 @@ venv/
 # deepbox runtime
 deepbox.db
 snapshot.txt
+data/
 *.log
 
 # OS / editor
