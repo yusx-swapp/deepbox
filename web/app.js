@@ -145,8 +145,15 @@ async function openAgent(agentId, name){
      <span style="flex:1"></span>
      <span id="stat" class="muted"></span>`;
   term.reset();
-  const sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
+  // Resume the newest PTY that is still alive on the devbox. Previously every
+  // click silently created a new session, making persisted history invisible.
+  const sessions = await api(`/api/agents/${agentId}/sessions`);
+  let sess = sessions.find(s => s.state === 'live');
+  const resumed = !!sess;
+  if(!sess) sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
   curSession = sess.id;
+  if(resumed) document.getElementById('termhead').querySelector('.muted').textContent =
+    '— resumed live session';
   wantOpen = true;
   connectTermWS();
 }

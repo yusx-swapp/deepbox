@@ -205,6 +205,30 @@ async def delete_agent(agent_id: str, request: Request, s: OrmSession = Depends(
 
 
 # ---------------------------------------------------------------- sessions
+@app.get("/api/agents/{agent_id}/sessions")
+async def list_agent_sessions(agent_id: str, request: Request,
+                              s: OrmSession = Depends(db)):
+    """List resumable sessions newest-first; opening an agent must not silently
+    create a new terminal and hide the persisted one."""
+    u = current_user(request, s)
+    a = s.get(Agent, agent_id)
+    if not a or a.devbox.owner_user_id != u.id:
+        raise HTTPException(404, "not found")
+    rows = s.scalars(select(Session).where(
+        Session.user_id == u.id, Session.agent_id == agent_id
+    ).order_by(Session.created_at.desc())).all()
+    result = []
+    for sess in rows:
+        ls = live_registry.get(sess.id)
+        state = ("live" if hub.is_session_active(agent_id, sess.id)
+                 else "ended" if ls and ls.ended else "inactive")
+        result.append({
+            "id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
+            "created_at": sess.created_at.isoformat(), "state": state,
+        })
+    return result
+
+
 @app.post("/api/agents/{agent_id}/sessions")
 async def create_session(agent_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
@@ -302,13 +326,16 @@ async def ws_devbox(ws: WebSocket):
                 sid = frame.get("session_id")
                 data = frame.get("data", "")
                 if sid:
-                    ls = live_registry.get(sid)
-                    if ls:
-                        ls.feed_output(data)      # update screen + DVR record
+                    # Create even when no viewer is attached. This is essential
+                    # after a server restart: connector drains output buffered
+                    # during downtime before a browser necessarily reconnects.
+                    ls = live_registry.get_or_create(sid)
+                    ls.feed_output(data)          # update screen + DVR record
                     await hub.to_session_humans(sid, frame)  # live broadcast
             elif t == "exit":
                 sid = frame.get("session_id")
                 if sid:
+                    conn.active_session_ids.discard(sid)
                     ls = live_registry.get(sid)
                     if ls:
                         ls.mark_ended(frame.get("code"))
@@ -316,12 +343,19 @@ async def ws_devbox(ws: WebSocket):
             elif t in ("ready", "presence"):
                 sid = frame.get("session_id")
                 if sid:
+                    if t == "ready":
+                        conn.active_session_ids.add(sid)
                     await hub.to_session_humans(sid, frame)
                 if t == "presence":
                     a = s.get(Agent, frame.get("agent_id"))
                     if a:
                         a.presence = frame.get("state", "online")
                         s.commit()
+            elif t == "sessions":
+                conn.active_session_ids = {
+                    item["session_id"] for item in frame.get("sessions", [])
+                    if item.get("agent_id") in conn.agent_ids and item.get("session_id")
+                }
             elif t == "runtimes":
                 d2 = s.get(Devbox, d.id)
                 d2.capabilities = frame.get("capabilities")

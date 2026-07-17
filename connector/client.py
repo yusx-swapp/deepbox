@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
+from collections import deque
 
 import httpx
 import websockets
@@ -35,6 +37,10 @@ class Connector:
         self.agents: dict[str, dict] = {}       # agent_id -> agent info
         # key = (agent_id, session_id) -> PtySession
         self.ptys: dict[tuple[str, str], PtySession] = {}
+        # PTY readers must never depend on server availability. Frames accumulate
+        # here while WS is down and are drained, in order, after reconnect.
+        self.pending: deque[dict] = deque()
+        self.pending_event = asyncio.Event()
         self.ws = None
 
     async def fetch_me(self):
@@ -75,13 +81,45 @@ class Connector:
             self.ws = ws
             hello = await ws.recv()
             print(f"[connector] connected: {hello}")
-            async for raw in ws:
-                await self.handle(raw)
+            # Re-advertise PTYs that survived a server restart. This lets the
+            # platform distinguish "resume the same process" from "start new".
+            await self.send({
+                "type": "sessions",
+                "sessions": [{"agent_id": aid, "session_id": sid}
+                             for aid, sid in self.ptys.keys()],
+            })
+            receiver = asyncio.create_task(self._receiver(ws))
+            sender = asyncio.create_task(self._sender(ws))
+            done, pending = await asyncio.wait(
+                {receiver, sender}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self.ws = None
+            for task in done:
+                exc = task.exception()
+                if exc:
+                    raise exc
+
+    async def _receiver(self, ws):
+        async for raw in ws:
+            await self.handle(raw)
+
+    async def _sender(self, ws):
+        while True:
+            if not self.pending:
+                self.pending_event.clear()
+                await self.pending_event.wait()
+            # Keep the frame at the head until send succeeds. On disconnect it
+            # remains queued and the next WS connection retries it.
+            frame = self.pending[0]
+            await ws.send(json.dumps(frame))
+            self.pending.popleft()
 
     async def send(self, frame: dict):
-        import json
-        if self.ws:
-            await self.ws.send(json.dumps(frame))
+        """Queue a frame without coupling PTY readers to WS availability."""
+        self.pending.append(frame)
+        self.pending_event.set()
 
     async def handle(self, raw: str):
         import json

@@ -65,21 +65,37 @@ def _color_code(col: str, fgbg: str) -> str:
         return ""
 
 
+def _render_line(line, columns: int) -> str:
+    out: list[str] = []
+    last = ""
+    for col in range(columns):
+        ch = line[col]
+        pre = _sgr_prefix(ch)
+        if pre != last:
+            out.append(pre)
+            last = pre
+        out.append(ch.data or " ")
+    out.append("\x1b[0m")
+    return "".join(out)
+
+
 def serialize_screen(screen: pyte.Screen) -> str:
-    """Render pyte's current screen into a byte string that, when written to a
-    fresh terminal, reproduces the exact current picture (colors + cursor)."""
-    out = ["\x1b[2J\x1b[H"]  # clear + home
+    """Reproduce scrollback + exact current picture in a fresh terminal.
+
+    ED(2) clears only the viewport (not xterm scrollback), so historical lines
+    are emitted first, then the viewport is cleared/repainted and cursor placed.
+    """
+    out: list[str] = []
+    history = getattr(screen, "history", None)
+    if history:
+        for line in history.top:
+            out.append(_render_line(line, screen.columns))
+            out.append("\r\n")
+    out.append("\x1b[2J\x1b[H")  # clear viewport + home, preserve scrollback
     for row in range(screen.lines):
         line = screen.buffer[row]
         out.append(f"\x1b[{row + 1};1H")
-        last = ""
-        for col in range(screen.columns):
-            ch = line[col]
-            pre = _sgr_prefix(ch)
-            if pre != last:
-                out.append(pre)
-                last = pre
-            out.append(ch.data or " ")
+        out.append(_render_line(line, screen.columns))
     out.append("\x1b[0m")
     # place cursor where it belongs
     out.append(f"\x1b[{screen.cursor.y + 1};{screen.cursor.x + 1}H")
@@ -91,7 +107,7 @@ class LiveSession:
         self.session_id = session_id
         self.cols = cols
         self.rows = rows
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = pyte.HistoryScreen(cols, rows, history=5000)
         self.stream = pyte.ByteStream(self.screen)
         self.subscribers: set = set()
         self.ended = False

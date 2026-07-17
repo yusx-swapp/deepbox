@@ -16,6 +16,7 @@ class DevboxConn:
     ws: WebSocket
     devbox_id: str
     agent_ids: set[str] = field(default_factory=set)
+    active_session_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(eq=False)
@@ -55,6 +56,10 @@ class Hub:
 
     def is_agent_online(self, agent_id: str) -> bool:
         return agent_id in self.agent_to_devbox
+
+    def is_session_active(self, agent_id: str, session_id: str) -> bool:
+        conn = self.devbox_for_agent(agent_id)
+        return bool(conn and session_id in conn.active_session_ids)
 
     # ---- human side ----
     def add_human(self, conn: HumanConn):

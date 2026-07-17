@@ -150,31 +150,34 @@ server: 校验 token
                           浏览器 xterm.js 终端视图
 ```
 
-**帧协议（WS，JSON，`protocol_version=1`）**
+**帧协议（WS，JSON，`protocol_version=2`；持久化语义详见 `persistence.md`）**
 
 Server → Devbox：
 - `hello` `{devbox_id, agent_ids, protocol_version}`
-- `open` `{agent_id, session_id}` —— 有用户开始一个会话，请确保该 agent 的 PTY 就绪
+- `open` `{agent_id, session_id, cols, rows}` —— 幂等地确保该 session 的 PTY 就绪
 - `input` `{agent_id, session_id, data}` —— 用户键入（转发到 PTY stdin）
-- `resize` `{agent_id, cols, rows}` —— 终端尺寸变化
-- `close` `{agent_id, session_id}` —— 用户离开会话（PTY 可保留以维持上下文）
+- `resize` `{agent_id, session_id, cols, rows}` —— 终端尺寸变化
+- `terminate` `{agent_id, session_id}` —— 用户显式结束会话时才杀 PTY
 
 Devbox → Server：
+- `sessions` `{sessions:[{agent_id,session_id}]}` —— 重连时上报仍存活的 PTY
 - `ready` `{agent_id, session_id}`
-- `output` `{agent_id, session_id, data}` —— PTY 输出（流式，逐块）
+- `output` `{agent_id, session_id, data}` —— PTY 输出（流式，逐块；WS 离线时 connector 排队）
 - `exit` `{agent_id, session_id, code}` —— CLI 进程退出
 - `presence` `{agent_id, state}` —— busy/online/error
 - `runtimes` `{capabilities:[…]}` —— 上报本机可用 CLI（handshake 后探测）
 
-Server → Human（浏览器 WS）：把对应 session 的 `output/ready/exit/presence` 透传，
-并把该用户的 `input/resize` 转成上面的 Devbox 帧。
+Human → Server：`attach/input/resize/detach/terminate`。`detach` 只取消观看，绝不杀 PTY。
+Server → Human：`restore/output/status/ready/exit/presence`；attach 后先还原 scrollback + 当前屏幕，
+随后衔接 live 输出。详见 `persistence.md`。
 
 > **为什么走 PTY 而不是 `-p` 一次性调用**：Claude Code / Copilot / Codex 这类 CLI 的
 > 价值在于**多轮、有记忆、可批准工具调用的交互式会话**。一次性调用会丢掉上下文、丢掉
 > 审批流、丢掉 TUI。PTY 转发让"平台里的终端"就是"本地那个终端"。
 >
-> **消息 vs 流**：结构化的会话元信息（谁在什么时候开了会话、标题）落 `message`/`session`
-> 表；高频的字节流不逐条落库（可选做**滚动日志**留存回放）。P0 先不持久化流，刷新即重连。
+> **消息 vs 流**：结构化会话元信息落 `message`/`session` 表；高频字节流写入每个 session
+> 的 asciicast v2 DVR 文件，同时进入 `pyte.HistoryScreen` 维护有限 scrollback 与当前屏幕。
+> 刷新、换设备或 server 重启后可 restore；实现细节见 `persistence.md`。
 
 跨平台注意：PTY 在 Linux/macOS 用 `pty`，Windows 用 `pywinpty`（ConPTY）。connector
 按平台选择实现；server 与协议完全平台无关。
@@ -195,8 +198,10 @@ Server → Human（浏览器 WS）：把对应 session 的 `output/ready/exit/pr
 | `DELETE /api/agents/:id` | 删除 agent |
 | `POST /api/devboxes/:id/tokens` | 轮换：发新 token（返回一次） |
 | `DELETE /api/tokens/:id` | 吊销 token |
+| `GET /api/agents/:id/sessions` | 列出该 agent 的会话及 live/inactive/ended 状态 |
 | `POST /api/agents/:id/sessions` | 开一个新会话，返回 session_id |
 | `GET /api/sessions/:id/messages` | 会话历史（结构化消息） |
+| `GET /api/sessions/:id/recording` | 下载 asciicast v2 DVR 录制 |
 
 **运行时（connector / Bearer token）**
 | 方法 · 路径 | 作用 |

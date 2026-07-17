@@ -96,7 +96,9 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
    - `resize`→ `pty.resize(cols, rows)`：同步终端尺寸。
    - `close` → `pty.kill()`。
 5. PTY 有输出就发 `output` 帧;进程退出发 `exit` 帧。
-6. 断线自动重连（外层 `while True` + 3s 退避）。
+6. 断线自动重连（外层 `while True` + 3s 退避）。PTY 输出先进入 connector 内存 FIFO，
+   sender 只有在 WS 发送成功后才弹出队首；server 离线时 reader 不会死、帧不会被移除，重连后
+   按序补发。connector 还会重新上报存活的 session，让 UI resume 同一 PTY。
 
 `resolve_cmd(runtime, launch_cmd)`：把 runtime 名映射到实际命令。
 `launch_cmd` 优先（可自定义任意命令），否则用默认表：

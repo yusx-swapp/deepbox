@@ -100,8 +100,17 @@ feed(data):
 "清屏 + 逐行带 SGR 颜色重绘 + 定位光标"的字节，发一帧 `restore`。浏览器写进一个干净的
 xterm 就**瞬间还原到当前画面**——无论离开了 1 秒还是 1 小时。
 
-**服务器重启也不丢**：`get_or_create` 时若 `.cast` 文件已存在，**把历史 `o` 事件重播进
-pyte 屏幕**即可重建当前态（PTY 仍在 devbox 上活着，重连即续）。
+**服务器重启也不丢**由三段机制共同保证：
+1. connector 的 PTY reader 只写入本地 FIFO；WS 不可用时输出帧留在队列，重连后按序补发，
+   不再让网络异常杀死 PTY reader。
+2. connector 重连后上报仍存活的 `(agent_id, session_id)`，server/UI 因而知道应该 **resume
+   同一进程**，而不是误建新 session。
+3. `get_or_create` 若发现 `.cast` 已存在，把历史 `o` 事件重播进 `pyte.HistoryScreen`，重建
+   当前屏幕和有限 scrollback；随后接上 connector 补发的离线期间输出。
+
+当前 FIFO 在 connector 内存中，因此覆盖 **server 重启 / 网络中断（connector 进程仍在）**；
+connector 自己重启时 PTY 也会消失。未来若要覆盖整台 devbox/connector 重启，需要把 PTY
+托管给 tmux/ConPTY 守护进程，并把 FIFO 做成本地磁盘 spool。
 
 **DVR 回放**：`GET /api/sessions/{id}/recording` 吐出 `.cast` 文件；web 的"回放"模式按时间戳
 播放（或秒进）。这是本地终端完全没有的能力——审计、复盘、分享一段 agent 工作过程。
@@ -133,7 +142,10 @@ server ↔ connector：
 ## 7. 浏览器端：自动重连 + 无缝还原
 
 - WS 断开 → 指数退避自动重连 → 重连后自动 `attach` → 收 `restore` 重画 → 继续。
-- 用户视角：**网络抖一下，画面顿一下就回来了，一个字都没丢**。
+- 点击 agent 时先查询其 session 列表；若 connector 上报了仍存活的 session，则打开最新的
+  `live` session，而不是每次点击都静默创建新 session。
+- restore 使用 `pyte.HistoryScreen`：先重建有限 scrollback，再精确重画当前 viewport 与光标。
+- 用户视角：**网络抖一下，画面顿一下就回来了，server 离线期间输出也会由 connector 补发**。
 - 换设备：登录 → 打开同一会话 → attach → restore，看到的就是另一台设备上的当前进度。
 - 会话已 ended：显示最终画面 + "回放历史"入口（DVR）。
 
