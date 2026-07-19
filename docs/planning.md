@@ -364,6 +364,17 @@ Workspace/Session 级：
 
 ## Cut 5 — Session Supervisor 与 Connector Service
 
+> **进度（P2 Cut 4：Supervisor/Transport 拆分已落地，先于磁盘 spool）**：
+> supervisor（会话所有权）/ transport（WS）代码级拆分已完成——`connector/supervisor.py`、
+> `connector/transport.py`、`connector/ipc.py`。默认 `python -m connector` 仍经进程内 `LoopbackChannel`
+> 保留兼容的单进程形态；`--mode supervisor` / `--mode transport` 则启用真实双进程，transport 重启/断开不再 kill PTY。
+> 本地 IPC 抽象已落地真实双进程传输：Windows 命名管道 / POSIX Unix socket（0600）、
+> 长度受限 JSON 帧（永不 pickle）、本地当前用户鉴权握手，并新增 `--mode supervisor|transport|all-in-one`
+> CLI（默认 all-in-one）；本机 Windows 命名管道 reconnect 、分离 transport detach/reconnect 下 FakePty
+> 存活均已有单测实测。durable spool（替换 `pending` deque）明确进入后续 P2 Cut 5；真实 Windows 服务
+> 形态下的 sessiond 长稳 + 真实 ConPTY / agent 长稳验证仍是真机验收门（需用户人工执行）——见
+> implementation.md §8a 真机验收门。
+
 ### 架构拆分
 
 ```text

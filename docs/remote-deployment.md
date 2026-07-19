@@ -274,6 +274,26 @@ connector 会：
 Token 只通过 `Authorization: Bearer` header 发送；Server 不接受 WS query-string token，避免 token
 进入 URL、代理日志和浏览器历史。
 
+### 5.6 可选：supervisor / transport 双进程
+
+默认命令仍是兼容的 all-in-one 模式。若要让网络 transport 独立重启而本地 PTY 继续存活，请在两个终端中使用
+相同的 `DEEPBOX_SERVER_URL` 和 `DEEPBOX_TOKEN` 环境变量。先启动长期驻留的 session supervisor：
+
+```bat
+.venv\Scripts\python -u -m connector --mode supervisor
+```
+
+再启动可重启的网络 transport：
+
+```bat
+.venv\Scripts\python -u -m connector --mode transport
+```
+
+两者通过当前用户专属的 Windows named pipe（POSIX 上为 `0600` Unix socket）通信，并使用当前用户本地密钥做
+带 5 秒超时的双向 HMAC 握手；帧是最大 1 MiB 的换行 JSON，不使用 pickle。同一时刻只接受一个 transport。停止或重启
+transport 不会关闭 supervisor 持有的 PTY；停止 supervisor 才会关闭这些 PTY。当前 pending 输出仍只在内存中，
+因此整台机器或 supervisor 崩溃后的 durable replay 属于后续磁盘 spool Cut，不应误解为本 Cut 已保证。
+
 ---
 
 ## 6. 端到端验收
