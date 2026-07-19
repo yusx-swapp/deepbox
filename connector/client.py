@@ -23,6 +23,17 @@ from .pty_session import PtySession, resolve_cmd, DEFAULT_CMDS
 
 PROTOCOL_VERSION = 2
 
+# How often the connector proves liveness to the server while otherwise idle.
+HEARTBEAT_INTERVAL = 20.0
+
+
+async def heartbeat_loop(websocket, interval: float = HEARTBEAT_INTERVAL) -> None:
+    """Send protocol heartbeats until the connection task is cancelled."""
+
+    while True:
+        await asyncio.sleep(interval)
+        await websocket.send(json.dumps({"type": "heartbeat"}))
+
 
 def ws_url(server_url: str) -> str:
     u = server_url.rstrip("/")
@@ -45,6 +56,9 @@ class Connector:
         self.pending: deque[dict] = deque()
         self.pending_event = asyncio.Event()
         self.ws = None
+        # Reconnect bookkeeping so operators can see stability over time.
+        self.connect_count = 0
+        self.last_heartbeat_ack = None
 
     async def fetch_me(self):
         async with httpx.AsyncClient(timeout=10.0) as c:
@@ -88,8 +102,9 @@ class Connector:
                 ws_url(self.server_url),
                 additional_headers={"Authorization": f"Bearer {self.token}"}) as ws:
             self.ws = ws
+            self.connect_count += 1
             hello = await ws.recv()
-            print(f"[connector] connected: {hello}")
+            print(f"[connector] connected (attempt #{self.connect_count}): {hello}")
             # Re-advertise PTYs that survived a server restart. This lets the
             # platform distinguish "resume the same process" from "start new".
             await self.send({
@@ -99,8 +114,9 @@ class Connector:
             })
             receiver = asyncio.create_task(self._receiver(ws))
             sender = asyncio.create_task(self._sender(ws))
+            heartbeat = asyncio.create_task(self._heartbeat(ws))
             done, pending = await asyncio.wait(
-                {receiver, sender}, return_when=asyncio.FIRST_COMPLETED)
+                {receiver, sender, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
@@ -113,6 +129,11 @@ class Connector:
     async def _receiver(self, ws):
         async for raw in ws:
             await self.handle(raw)
+
+    async def _heartbeat(self, ws):
+        # Periodic liveness ping. Keeps the WS path warm through idle NATs and
+        # gives the server a fresh last_seen even when no session is active.
+        await heartbeat_loop(ws)
 
     async def _sender(self, ws):
         while True:
@@ -136,6 +157,9 @@ class Connector:
         t = frame.get("type")
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
+        if t == "heartbeat_ack":
+            self.last_heartbeat_ack = frame.get("ts")
+            return
         if t == "open":
             await self.open_pty(aid, sid, frame.get("cols", 120), frame.get("rows", 30))
         elif t == "input":

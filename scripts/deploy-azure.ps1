@@ -26,6 +26,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$gitCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $gitCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'Could not resolve the source Git commit.'
+}
 
 # Generate a strong session secret if one was not supplied.
 if (-not $DeepboxSecret) {
@@ -51,7 +55,8 @@ az deployment group create `
         deepboxSecret=$secretPlain `
         registrationEnabled=$($RegistrationEnabled.IsPresent) `
         allowedOrigins="https://$WebAppName.azurewebsites.net" `
-        publicUrl="https://$WebAppName.azurewebsites.net" | Out-Null
+        publicUrl="https://$WebAppName.azurewebsites.net" `
+        gitCommit=$gitCommit | Out-Null
 
 # Build a deployment zip (server, web UI, startup script, and server requirements).
 $zipPath = Join-Path $env:TEMP "deepbox-deploy-$([guid]::NewGuid()).zip"

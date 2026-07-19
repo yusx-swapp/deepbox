@@ -34,6 +34,9 @@ param registrationEnabled bool = false
 @description('Persistent data directory on the /home volume.')
 param dataDir string = '/home/deepbox'
 
+@description('Source Git commit embedded in this deployment for build provenance.')
+param gitCommit string = 'unknown'
+
 var linuxFxVersion = 'PYTHON|3.12'
 
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
@@ -86,6 +89,7 @@ resource site 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'DEEPBOX_COOKIE_SECURE', value: 'true' }
         { name: 'DEEPBOX_COOKIE_SAMESITE', value: 'lax' }
         { name: 'DEEPBOX_REGISTRATION_ENABLED', value: string(registrationEnabled) }
+        { name: 'DEEPBOX_GIT_COMMIT', value: gitCommit }
       ]
     }
   }

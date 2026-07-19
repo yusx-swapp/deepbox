@@ -57,6 +57,13 @@ class Settings:
     forwarded_allow_ips: str
     registration_enabled: bool
     bootstrap_token_hash: str | None
+    # Capacity thresholds (operator-tunable). Warn is a soft signal; alert is
+    # a hard signal an operator should act on. Database size is measured in MB;
+    # recording-disk free space is measured in MB remaining.
+    db_size_warn_mb: float
+    db_size_alert_mb: float
+    disk_free_warn_mb: float
+    disk_free_alert_mb: float
 
     @property
     def production(self) -> bool:
@@ -103,6 +110,32 @@ class Settings:
             raise RuntimeError("production origins must use HTTPS")
         if not (1 <= self.port <= 65535):
             raise RuntimeError("DEEPBOX_PORT must be between 1 and 65535")
+        for name, value in (
+            ("DEEPBOX_DB_SIZE_WARN_MB", self.db_size_warn_mb),
+            ("DEEPBOX_DB_SIZE_ALERT_MB", self.db_size_alert_mb),
+            ("DEEPBOX_DISK_FREE_WARN_MB", self.disk_free_warn_mb),
+            ("DEEPBOX_DISK_FREE_ALERT_MB", self.disk_free_alert_mb),
+        ):
+            if value < 0:
+                raise RuntimeError(f"{name} must be non-negative")
+        # A database that must alert before it warns is a misconfiguration.
+        if self.db_size_alert_mb < self.db_size_warn_mb:
+            raise RuntimeError(
+                "DEEPBOX_DB_SIZE_ALERT_MB must be >= DEEPBOX_DB_SIZE_WARN_MB"
+            )
+        # Free-disk thresholds count down: alert triggers at a lower free
+        # figure than warn, so the alert bound must not exceed the warn bound.
+        if self.disk_free_alert_mb > self.disk_free_warn_mb:
+            raise RuntimeError(
+                "DEEPBOX_DISK_FREE_ALERT_MB must be <= DEEPBOX_DISK_FREE_WARN_MB"
+            )
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw.strip())
 
 
 def _port() -> int:
@@ -157,6 +190,10 @@ def load_settings() -> Settings:
         forwarded_allow_ips=forwarded_allow_ips,
         registration_enabled=_bool("DEEPBOX_REGISTRATION_ENABLED", registration_default),
         bootstrap_token_hash=bootstrap_token_hash,
+        db_size_warn_mb=_float("DEEPBOX_DB_SIZE_WARN_MB", 256.0),
+        db_size_alert_mb=_float("DEEPBOX_DB_SIZE_ALERT_MB", 1024.0),
+        disk_free_warn_mb=_float("DEEPBOX_DISK_FREE_WARN_MB", 1024.0),
+        disk_free_alert_mb=_float("DEEPBOX_DISK_FREE_ALERT_MB", 256.0),
     )
     result.validate()
     return result

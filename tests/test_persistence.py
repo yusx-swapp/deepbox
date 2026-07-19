@@ -1,10 +1,11 @@
 import asyncio
+import json
 import unittest
 import uuid
 
 import pyte
 
-from connector.client import Connector
+from connector.client import Connector, heartbeat_loop
 from server.app.live import LiveSession, serialize_screen
 
 
@@ -42,6 +43,19 @@ class ConnectorBufferTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(healthy.frames), 1)
         self.assertEqual(len(connector.pending), 0)
+
+    async def test_idle_connection_emits_protocol_heartbeat(self):
+        socket = RecordingWebSocket()
+        task = asyncio.create_task(heartbeat_loop(socket, interval=0.001))
+        for _ in range(20):
+            if socket.frames:
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(socket.frames)
+        self.assertEqual(json.loads(socket.frames[0]), {"type": "heartbeat"})
 
 
 class ScreenRestoreTests(unittest.TestCase):

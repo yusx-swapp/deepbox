@@ -208,6 +208,29 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
 
 ---
 
+## 7a. 最小生产运维（P1 Cut 3）
+
+详见 [`docs/operations.md`](operations.md)。实现分布：
+
+- `server/app/logging.py` — 结构化 JSON 日志（每行一个对象，`ts/level/logger/message` +
+  `event` 字段）。`configure_logging()` 幂等安装 handler，`log_event()` 丢弃 `None`
+  字段以避免泄露未设置的密钥。`main.py` 在导入时调用一次，`DEEPBOX_LOG_LEVEL` 控制级别。
+- connector 心跳：`connector/client.py` 每 20s 发送 `{"type":"heartbeat"}`，服务端刷新
+  `last_seen_at` 并回 `heartbeat_ack`；`connect_count` 让重连可见。服务端把
+  online/offline 记为结构化事件。
+- `server/app/version.py` — 版本与 Git 构建来源。`/api/version` 仅公开
+  `{version, commit}`（短哈希，公开安全）；`/api/admin/version`（owner）附完整
+  commit 与 `dirty`。部署产物用 `DEEPBOX_GIT_COMMIT` 注入。
+- `server/app/capacity.py` — 纯函数阈值判定（数据库越大越差、磁盘剩余越小越差），
+  `/api/admin/capacity`（owner）返回 ok/warn/alert。阈值经 `config.py` 校验。
+- `server/ops/backup.py` — SQLite 在线备份（`integrity_check` 校验）与恢复（校验 +
+  live-server 守卫，`--force` 才能覆盖运行中的库；`.pre-restore` 侧车 + `os.replace`
+  原子替换）。
+- `server/ops/smoke.py` — 重启后冒烟：命中 `/api/health`、`/api/ready`、`/api/version`，
+  失败非零退出，可作为部署门禁。
+
+---
+
 ## 8. 现在的边界
 
 - output 已写 asciicast DVR，并维护有限 scrollback；connector 断线时使用**内存** FIFO，但尚无

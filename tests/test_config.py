@@ -28,6 +28,10 @@ def make_settings(**overrides):
         forwarded_allow_ips="127.0.0.1",
         registration_enabled=True,
         bootstrap_token_hash=None,
+        db_size_warn_mb=256.0,
+        db_size_alert_mb=1024.0,
+        disk_free_warn_mb=1024.0,
+        disk_free_alert_mb=256.0,
     )
     base.update(overrides)
     return Settings(**base)

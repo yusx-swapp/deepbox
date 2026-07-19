@@ -29,6 +29,34 @@ from .util import (
 from .hub import hub, DevboxConn, HumanConn
 from .config import settings
 from .live import live_registry
+from .logging import configure_logging, log_event
+from .capacity import collect_capacity, transition_event
+from . import version as version_info
+
+import logging as _logging
+
+configure_logging(os.getenv("DEEPBOX_LOG_LEVEL", "INFO"))
+logger = _logging.getLogger("deepbox")
+_capacity_status = "ok"
+
+
+def observe_capacity(report, *, source: str) -> None:
+    """Log only capacity transitions, avoiding one warning per health probe."""
+
+    global _capacity_status
+    event = transition_event(_capacity_status, report.status)
+    _capacity_status = report.status
+    if event is None:
+        return
+    log_event(
+        logger,
+        event,
+        level=_logging.INFO if report.status == "ok" else _logging.WARNING,
+        status=report.status,
+        resources=[r.name for r in report.resources if r.status != "ok"],
+        source=source,
+    )
+
 
 signer = URLSafeSerializer(settings.secret, salt="deepbox-session")
 
@@ -63,7 +91,38 @@ async def ready(s: OrmSession = Depends(db)):
             raise OSError("data directory is not writable")
     except Exception:
         raise HTTPException(503, "not ready")
+
+    # Azure probes readiness continuously, so this also makes disk-pressure
+    # warnings proactive without changing readiness or exposing local paths.
+    report = collect_capacity(settings)
+    observe_capacity(report, source="readiness_probe")
     return {"status": "ready", "protocol_version": PROTOCOL_VERSION}
+
+
+@app.get("/api/version", include_in_schema=False)
+async def version_public():
+    """Public build provenance: marketing version + short commit only.
+
+    Intentionally omits working-tree state and paths so it is safe to expose
+    without authentication.
+    """
+    return version_info.public_version()
+
+
+@app.get("/api/admin/version", include_in_schema=False)
+async def version_detailed(request: Request, s: OrmSession = Depends(db)):
+    """Operator build provenance (owner-only): full commit + dirty flag."""
+    require_owner(request, s)
+    return version_info.detailed_version()
+
+
+@app.get("/api/admin/capacity", include_in_schema=False)
+async def capacity_status(request: Request, s: OrmSession = Depends(db)):
+    """Owner-only capacity report for the database and recording disk."""
+    require_owner(request, s)
+    report = collect_capacity(settings)
+    observe_capacity(report, source="admin_api")
+    return report.to_dict()
 
 
 # ---------------------------------------------------------------- auth helpers
@@ -581,6 +640,8 @@ async def ws_devbox(ws: WebSocket):
     await ws.accept()
     conn = DevboxConn(ws=ws, devbox_id=d.id, agent_ids=agent_ids)
     await hub.add_devbox(conn)
+    log_event(logger, "connector.online", devbox_id=d.id,
+              agent_count=len(agent_ids))
     await ws.send_json({"type": "hello", "devbox_id": d.id,
                         "agent_ids": list(agent_ids),
                         "protocol_version": PROTOCOL_VERSION})
@@ -588,7 +649,18 @@ async def ws_devbox(ws: WebSocket):
         while True:
             frame = await ws.receive_json()
             t = frame.get("type")
-            if t == "output":
+            if t == "heartbeat":
+                # Liveness ping from the connector. Refresh last_seen and echo an
+                # ack so the connector can measure round-trip health.
+                dd = s.get(Devbox, d.id)
+                if dd:
+                    dd.last_seen_at = now()
+                    s.commit()
+                await ws.send_json({"type": "heartbeat_ack",
+                                    "ts": now().isoformat()})
+                log_event(logger, "connector.heartbeat",
+                          level=_logging.DEBUG, devbox_id=d.id)
+            elif t == "output":
                 sid = frame.get("session_id")
                 data = frame.get("data", "")
                 if sid:
@@ -630,6 +702,7 @@ async def ws_devbox(ws: WebSocket):
         pass
     finally:
         await hub.remove_devbox(d.id)
+        log_event(logger, "connector.offline", devbox_id=d.id)
         dd = s.get(Devbox, d.id)
         if dd:
             for a in dd.agents:
