@@ -58,6 +58,10 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("output", types)
         self.assertIn("ready", types)
         self.assertIn(("a", "s"), sup.ptys)
+        durable_types = [
+            frame["type"] for _delivery_id, frame in sup._spool.pending_records()
+        ]
+        self.assertEqual(durable_types, ["output"])
 
     async def test_transport_restart_does_not_kill_pty(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
@@ -95,7 +99,8 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unacknowledged_delivery_stays_pending_for_next_transport(self):
         sup = SessionSupervisor()
-        sup.emit({"type": "output", "data": "keep-me"})
+        sup.emit({"type": "output", "session_id": "s",
+                  "pty_instance_id": "p", "data": "keep-me"})
         sup_end, tx_end = LoopbackChannel.pair()
         sup.attach(sup_end)
         drain = asyncio.create_task(sup.drain_to(sup_end))
@@ -122,16 +127,47 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
         await sup.handle_control({"type": "open", "agent_id": "a", "session_id": "s"})
         p = FakePty.instances[0]
-        await sup.handle_control({"type": "input", "agent_id": "a", "session_id": "s", "data": "ls\n"})
+        await sup.handle_control({"type": "input", "agent_id": "a", "session_id": "s",
+                                  "client_input_id": "11111111-1111-4111-8111-111111111111",
+                                  "data": "ls\n"})
         await sup.handle_control({"type": "resize", "agent_id": "a", "session_id": "s", "cols": 80, "rows": 24})
         self.assertEqual(p.written, ["ls\n"])
         self.assertEqual(p.size, (80, 24))
+
+    async def test_duplicate_input_id_writes_once_and_acks_each_delivery(self):
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        await sup.handle_control({"type": "open", "agent_id": "a", "session_id": "s"})
+        p = FakePty.instances[0]
+        frame = {"type": "input", "agent_id": "a", "session_id": "s",
+                 "client_input_id": "22222222-2222-4222-8222-222222222222",
+                 "data": "once"}
+        await sup.handle_control(dict(frame))
+        await sup.handle_control(dict(frame))
+        self.assertEqual(p.written, ["once"])
+        acks = [f for f in sup.pending if f.get("type") == "input_ack"]
+        self.assertEqual(len(acks), 2)
+        self.assertTrue(all(f["status"] == "delivered" for f in acks))
+
+    async def test_pty_instance_is_stable_and_output_seq_increments(self):
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        open_frame = {"type": "open", "agent_id": "a", "session_id": "s"}
+        await sup.handle_control(open_frame)
+        instance_id = sup.pty_instances[("a", "s")]
+        await sup.handle_control(open_frame)
+        self.assertEqual(sup.pty_instances[("a", "s")], instance_id)
+        self.assertEqual(len(FakePty.instances), 1)
+        await FakePty.instances[0].on_output("second")
+        outputs = [f for f in sup.pending if f.get("type") == "output"]
+        self.assertEqual([f["seq"] for f in outputs], [1, 2])
+        self.assertTrue(all(f["pty_instance_id"] == instance_id for f in outputs))
 
     async def test_status_reports_sessions_and_pending(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
         await sup.handle_control({"type": "open", "agent_id": "a", "session_id": "s"})
         st = sup.status()
-        self.assertEqual(st["sessions"], [{"agent_id": "a", "session_id": "s"}])
+        self.assertEqual(st["sessions"][0]["agent_id"], "a")
+        self.assertEqual(st["sessions"][0]["session_id"], "s")
+        self.assertTrue(st["sessions"][0]["pty_instance_id"])
         self.assertGreater(st["pending_frames"], 0)
 
     async def test_shutdown_kills_all(self):

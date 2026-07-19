@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 from pathlib import Path
+from uuid import UUID, uuid4
 
 from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends, WebSocket,
@@ -29,6 +30,7 @@ from .util import (
 from .hub import hub, DevboxConn, HumanConn
 from .config import settings
 from .live import live_registry
+from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID
 from .logging import configure_logging, log_event
 from .capacity import collect_capacity, transition_event
 from . import version as version_info
@@ -38,6 +40,22 @@ import logging as _logging
 configure_logging(os.getenv("DEEPBOX_LOG_LEVEL", "INFO"))
 logger = _logging.getLogger("deepbox")
 _capacity_status = "ok"
+
+
+def _durable_events_loader(session_id: str):
+    """Load committed v3 frames for a session using a short-lived DB session.
+
+    Used by the LiveRegistry so it never retains a request-scoped Session.
+    """
+    db = models.SessionLocal()
+    try:
+        return RecordingStore.durable_events(db, session_id)
+    finally:
+        db.close()
+
+
+live_registry.durable_loader = _durable_events_loader
+recording_store = RecordingStore()
 
 
 def observe_capacity(report, *, source: str) -> None:
@@ -576,17 +594,25 @@ async def session_messages(session_id: str, request: Request, s: OrmSession = De
 
 @app.get("/api/sessions/{session_id}/recording")
 async def session_recording(session_id: str, request: Request, s: OrmSession = Depends(db)):
-    """Return the asciicast v2 DVR recording for replay/audit."""
+    """Return the asciicast v2 DVR recording for replay/audit.
+
+    Merges legacy .cast history with durable Protocol v3 output frames so each
+    event appears exactly once, in deterministic order.
+    """
     u = current_user(request, s)
     sess = s.get(Session, session_id)
     if not sess or sess.user_id != u.id:
         raise HTTPException(404, "not found")
-    from .live import DATA_DIR
+    from .live import cast_header, DATA_DIR
     from fastapi.responses import PlainTextResponse
-    path = DATA_DIR / f"{session_id}.cast"
-    if not path.exists():
+    merged = live_registry.merged_events(session_id)
+    cast_path = DATA_DIR / f"{session_id}.cast"
+    if not merged and not cast_path.exists():
         raise HTTPException(404, "no recording")
-    return PlainTextResponse(path.read_text(encoding="utf-8"),
+    lines = [json.dumps(cast_header(session_id))]
+    for ev in merged:
+        lines.append(json.dumps([ev[0], ev[1], ev[2]]))
+    return PlainTextResponse("\n".join(lines) + "\n",
                              media_type="application/x-asciicast")
 
 
@@ -662,14 +688,66 @@ async def ws_devbox(ws: WebSocket):
                           level=_logging.DEBUG, devbox_id=d.id)
             elif t == "output":
                 sid = frame.get("session_id")
-                data = frame.get("data", "")
-                if sid:
-                    # Create even when no viewer is attached. This is essential
-                    # after a server restart: connector drains output buffered
-                    # during downtime before a browser necessarily reconnects.
+                if frame.get("seq") is not None or frame.get("pty_instance_id"):
+                    # Protocol v3 durable output: persist first, ACK only after
+                    # the row is committed. Never blindly accept output.
+                    result = recording_store.persist_output(s, devbox_id=d.id,
+                                                             frame=frame)
+                    if result.outcome == NEW:
+                        # Feed the live screen exactly once (no .cast dual-write)
+                        # and broadcast to any attached viewers.
+                        ls = live_registry.get_or_create(sid)
+                        ls.feed_live_output(frame.get("data", ""))
+                        await hub.to_session_humans(sid, frame)
+                        await ws.send_json({
+                            "type": "ack", "session_id": sid,
+                            "pty_instance_id": frame.get("pty_instance_id"),
+                            "seq": frame.get("seq")})
+                    elif result.outcome == DUPLICATE:
+                        # Already durable and identical: re-ACK, do NOT re-feed
+                        # or re-broadcast.
+                        await ws.send_json({
+                            "type": "ack", "session_id": sid,
+                            "pty_instance_id": frame.get("pty_instance_id"),
+                            "seq": frame.get("seq")})
+                    elif result.outcome == GAP:
+                        await ws.send_json({
+                            "type": "resend", "session_id": sid,
+                            "pty_instance_id": frame.get("pty_instance_id"),
+                            "expected_seq": result.expected_seq})
+                    elif result.outcome == CONFLICT:
+                        log_event(logger, "recording.conflict", devbox_id=d.id,
+                                  session_id=sid, seq=frame.get("seq"))
+                        await ws.send_json({
+                            "type": "error", "session_id": sid,
+                            "message": "conflicting duplicate frame"})
+                    else:  # INVALID / ownership
+                        log_event(logger, "recording.invalid", devbox_id=d.id,
+                                  session_id=sid, reason=result.reason)
+                        await ws.send_json({
+                            "type": "error", "session_id": sid,
+                            "message": result.reason or "invalid output frame"})
+                elif sid:
+                    # Legacy (< v3) blind output path.
+                    data = frame.get("data", "")
                     ls = live_registry.get_or_create(sid)
                     ls.feed_output(data)          # update screen + DVR record
                     await hub.to_session_humans(sid, frame)  # live broadcast
+
+            elif t == "input_ack":
+                sid = frame.get("session_id")
+                client_input_id = frame.get("client_input_id")
+                sess = s.get(Session, sid) if sid else None
+                try:
+                    client_input_id = str(UUID(str(client_input_id)))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if sess and sess.agent_id in conn.agent_ids:
+                    ls = live_registry.get(sid)
+                    if ls and frame.get("status") == "delivered":
+                        ls.acknowledge_input(client_input_id)
+                    frame["client_input_id"] = client_input_id
+                    await hub.to_session_humans(sid, frame)
             elif t == "exit":
                 sid = frame.get("session_id")
                 if sid:
@@ -771,10 +849,22 @@ async def ws_term(ws: WebSocket):
                 sid = frame.get("session_id")
                 agent_id = conn.sessions.get(sid)
                 if agent_id:
+                    raw_input_id = frame.get("client_input_id") or str(uuid4())
+                    try:
+                        client_input_id = str(UUID(str(raw_input_id)))
+                    except (TypeError, ValueError, AttributeError):
+                        await ws.send_json({"type": "error", "message": "invalid client_input_id"})
+                        continue
+                    data = frame.get("data", "")
+                    if not isinstance(data, str):
+                        await ws.send_json({"type": "error", "message": "invalid input data"})
+                        continue
                     ls = live_registry.get(sid)
                     if ls:
-                        ls.record_input(frame.get("data", ""))
+                        ls.queue_input(client_input_id, data)
                     frame["agent_id"] = agent_id
+                    frame["client_input_id"] = client_input_id
+                    frame["data"] = data
                     await hub.to_devbox(agent_id, frame)
             elif t == "resize":
                 sid = frame.get("session_id")

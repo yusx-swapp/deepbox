@@ -291,8 +291,8 @@ Token 只通过 `Authorization: Bearer` header 发送；Server 不接受 WS quer
 
 两者通过当前用户专属的 Windows named pipe（POSIX 上为 `0600` Unix socket）通信，并使用当前用户本地密钥做
 带 5 秒超时的双向 HMAC 握手；帧是最大 1 MiB 的换行 JSON，不使用 pickle。同一时刻只接受一个 transport。停止或重启
-transport 不会关闭 supervisor 持有的 PTY；停止 supervisor 才会关闭这些 PTY。当前 pending 输出仍只在内存中，
-因此整台机器或 supervisor 崩溃后的 durable replay 属于后续磁盘 spool Cut，不应误解为本 Cut 已保证。
+transport 不会关闭 supervisor 持有的 PTY；停止 supervisor 才会关闭这些 PTY。P2 Cut 5 起 pending 输出由持久磁盘
+spool（`connector/spool.py`）使用 SQLite WAL + `synchronous=FULL`：PTY output 先以 `(session_id, pty_instance_id, seq)` 提交本地 outbox，再经 transport 发送。`ws.send()` 成功不会删除记录；只有 Azure server 把同一输出提交到 `recording_frames` 并返回完全匹配的 Protocol v3 ACK 后，supervisor 才连续推进 `ack_state` 并删除队首。persist 后 ACK 前断线会重发并由 server 幂等 re-ACK；gap 返回精确 resend，冲突 fail closed。spool 按 server URL + token hash 确定性命名但不保存 token，目录尽力设置为用户私有。输入通过持久 `client_input_id` receipt 去重，并在 connector 确认 PTY delivery 后回 browser ACK。
 
 ---
 
@@ -417,4 +417,4 @@ tailscale serve reset
 - connector 使用内存 FIFO；Server 短暂重启可恢复，但 connector 自身退出会丢 PTY。
 - 当前不是公开互联网部署方案。
 - Tailscale 解决网络加密和设备可达性，不代替 deepbox 应用层认证、权限和 recording 隐私。
-- Session Control Center、durable seq/ACK spool 和完整 Replay UI 属于后续 Cuts。
+- Session Control Center 与完整 Replay UI 属于后续 Cuts；connector 侧 durable seq/ACK 磁盘 spool 已在 P2 Cut 5 落地。

@@ -54,6 +54,7 @@ from .ipc import (
 )
 from .pty_session import DEFAULT_CMDS
 from .supervisor import SessionSupervisor
+from .spool import open_spool
 from .transport import (
     HEARTBEAT_INTERVAL,
     PROTOCOL_VERSION,
@@ -83,10 +84,10 @@ class Connector:
     attaches a :class:`TransportSession` over a fresh loopback channel.
     """
 
-    def __init__(self, server_url: str, token: str):
+    def __init__(self, server_url: str, token: str, spool=None):
         self.server_url = server_url.rstrip("/")
         self.token = token
-        self.supervisor = SessionSupervisor()
+        self.supervisor = SessionSupervisor(spool=spool)
         self.ws = None
         self.connect_count = 0
         self.last_heartbeat_ack = None
@@ -118,15 +119,32 @@ class Connector:
         self.supervisor.emit(frame)
 
     async def _sender(self, ws):
-        """Drain buffered frames straight to a websocket (legacy test seam)."""
+        """Drain buffered frames straight to a websocket (legacy test seam).
+
+        Control frames retain their send-boundary ACK. Protocol-v3 output cannot
+        be released by this sender-only compatibility seam because it has no
+        websocket receive path; runtime connections use ``TransportSession``.
+        """
         while True:
-            if not self.pending:
+            records = self.supervisor._spool.pending_records()
+            if self.supervisor._controls:
+                delivery_id, frame = self.supervisor._controls[0]
+            elif records:
+                delivery_id, frame = records[0]
+            else:
                 self.pending_event.clear()
+                if (self.supervisor._controls or
+                        self.supervisor._spool.pending_records()):
+                    continue
                 await self.pending_event.wait()
                 continue
-            frame = self.pending[0]
             await ws.send(json.dumps(frame))
-            self.pending.popleft()
+            if frame.get("type") == "output":
+                # Only an exact server durability ACK may release this row.
+                await asyncio.Future()
+            if (self.supervisor._controls and
+                    self.supervisor._controls[0][0] == delivery_id):
+                self.supervisor._controls.popleft()
 
     async def handle(self, raw: str):
         await self.supervisor.handle_control(json.loads(raw))
@@ -226,8 +244,8 @@ class SupervisorService:
     """
 
     def __init__(self, agents: dict[str, dict] | None = None,
-                 endpoint: str | None = None):
-        self.supervisor = SessionSupervisor(agents)
+                 endpoint: str | None = None, spool=None):
+        self.supervisor = SessionSupervisor(agents, spool=spool)
         self.endpoint = endpoint or default_endpoint()
         self._server = None
         self._busy = asyncio.Lock()  # enforces one transport at a time
@@ -293,7 +311,8 @@ async def run_supervisor(server_url: str, token: str,
         # A previous supervisor may have died leaving a stale POSIX socket.
         if cleanup_stale_endpoint(endpoint=address):
             print(f"[sessiond] removed stale endpoint state for {address}")
-    service = SupervisorService(dict(bootstrap.agents), endpoint=address)
+    service = SupervisorService(dict(bootstrap.agents), endpoint=address,
+                                spool=open_spool(server_url, token))
     await service.serve()
 
 
@@ -401,7 +420,8 @@ async def main():
         await run_transport(args.server_url, args.token, args.endpoint)
         return
 
-    c = Connector(args.server_url, args.token)
+    c = Connector(args.server_url, args.token,
+                  spool=open_spool(args.server_url, args.token))
     while True:
         try:
             await c.run()

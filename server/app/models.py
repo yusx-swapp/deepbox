@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import datetime as dt
 from sqlalchemy import (
-    create_engine, String, Text, ForeignKey, DateTime, JSON, inspect, text,
+    create_engine, String, Text, ForeignKey, DateTime, JSON, Integer, Float,
+    UniqueConstraint, inspect, text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker,
 )
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
@@ -126,6 +127,35 @@ class Invitation(Base):
     redeemed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     redeemed_by: Mapped[str | None] = mapped_column(String, nullable=True)
     revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RecordingFrame(Base):
+    """Durable Protocol v3 output frame.
+
+    One row per accepted (session_id, pty_instance_id, seq) triple. The unique
+    constraint lets SQLite arbitrate concurrent inserts so an ACK is only ever
+    sent after a committed row exists. ``payload_hash`` lets a re-sent frame be
+    distinguished as an identical duplicate (safe to re-ACK) from a conflicting
+    duplicate (same seq, different bytes -> reject).
+    """
+    __tablename__ = "recording_frame"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "pty_instance_id", "seq",
+            name="uq_recording_frame_seq",
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), index=True)
+    pty_instance_id: Mapped[str] = mapped_column(String, index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String, default="o")  # asciicast event code
+    data: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String)
+    elapsed: Mapped[float | None] = mapped_column(Float, nullable=True)
+    timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
 
 _engine = None

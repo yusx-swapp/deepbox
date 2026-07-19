@@ -364,14 +364,17 @@ Workspace/Session 级：
 
 ## Cut 5 — Session Supervisor 与 Connector Service
 
-> **进度（P2 Cut 4：Supervisor/Transport 拆分已落地，先于磁盘 spool）**：
+> **进度（P2 Cut 4 拆分 + P2 Cut 5 持久磁盘 spool 均已落地）**：
 > supervisor（会话所有权）/ transport（WS）代码级拆分已完成——`connector/supervisor.py`、
 > `connector/transport.py`、`connector/ipc.py`。默认 `python -m connector` 仍经进程内 `LoopbackChannel`
 > 保留兼容的单进程形态；`--mode supervisor` / `--mode transport` 则启用真实双进程，transport 重启/断开不再 kill PTY。
 > 本地 IPC 抽象已落地真实双进程传输：Windows 命名管道 / POSIX Unix socket（0600）、
 > 长度受限 JSON 帧（永不 pickle）、本地当前用户鉴权握手，并新增 `--mode supervisor|transport|all-in-one`
 > CLI（默认 all-in-one）；本机 Windows 命名管道 reconnect 、分离 transport detach/reconnect 下 FakePty
-> 存活均已有单测实测。durable spool（替换 `pending` deque）明确进入后续 P2 Cut 5；真实 Windows 服务
+> 存活均已有单测实测。
+>
+> **P2 Cut 5 Protocol v3 durable delivery（已落地）**：connector 使用 SQLite WAL + `synchronous=FULL` 的 `outbox/ack_state/input_receipts`；每个 PTY 启动生成稳定 `pty_instance_id`，输出按 `(session_id, pty_instance_id)` 分配连续 seq 并先提交 spool。transport 只有收到 server 对同一三元组的 durable ACK 才释放队首；send 成功不算 ACK，persist-before-ACK 断线会安全重放，duplicate 会重新 ACK，gap 会请求精确 resend，冲突 fail closed。server 的 `recording_frames` 在 ACK 前提交并做 ownership、唯一键和内容哈希校验。输入使用 UUID `client_input_id` 本地持久去重，server 收到 `input_ack` 后才写 cast。控制帧保留 send-boundary ACK，但只进 sessiond 内存队列，不写 durable spool、不制造 PTY 输出 gap，也不在重启后陈旧重放。
+> 真实 Windows 服务
 > 形态下的 sessiond 长稳 + 真实 ConPTY / agent 长稳验证仍是真机验收门（需用户人工执行）——见
 > implementation.md §8a 真机验收门。
 
@@ -724,7 +727,7 @@ Session/Job 关联：
 
 | 风险 | 影响 | 当前缓解 | 后续动作 |
 |---|---|---|---|
-| Server ACK 前崩溃丢帧 | Session 历史不完整 | 内存 FIFO | Cut 3 seq/ACK/磁盘 spool |
+| Server ACK 前崩溃丢帧 | Session 历史不完整 | P2 Cut 5 持久磁盘 spool（seq/ACK/fsync/resume）已落地 | Cut 3 端到端 server 侧 seq 对账 |
 | connector 退出杀 PTY | Agent 上下文消失 | 自动重连仅覆盖网络 | Cut 5 session supervisor |
 | Recording 含 secret | 高隐私风险 | 仅 owner API | Cut 4 retention + Cut 6 加密/权限 |
 | Session 状态漂移 | UI 错误恢复/误启动 | surviving session 上报 | Cut 1 generation + DB 状态机 |

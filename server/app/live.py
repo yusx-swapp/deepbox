@@ -113,6 +113,8 @@ class LiveSession:
         self.subscribers: set = set()
         self.ended = False
         self.exit_code: int | None = None
+        self.delivered_input_ids: set[str] = set()
+        self.pending_inputs: dict[str, str] = {}
         self.start_time = time.time()
         self.cast_path = DATA_DIR / f"{session_id}.cast"
         self._open_cast()
@@ -152,13 +154,66 @@ class LiveSession:
                 if kind == "o":
                     self.stream.feed(data.encode("utf-8", "replace"))
 
+    def cast_events(self) -> list:
+        """Read legacy .cast output events as [t, kind, data] lists."""
+        events: list = []
+        if not self.cast_path.exists():
+            return events
+        with open(self.cast_path, encoding="utf-8") as fp:
+            first = True
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                if first:
+                    first = False  # header
+                    continue
+                try:
+                    t, kind, data = json.loads(line)
+                except Exception:
+                    continue
+                events.append([t, kind, data])
+        return events
+
+    def feed_durable_events(self, events) -> None:
+        """Feed committed v3 output frames into the screen (no .cast write)."""
+        for _t, kind, data in events:
+            if kind == "o":
+                self.stream.feed(data.encode("utf-8", "replace"))
+
+    def feed_live_output(self, data: str) -> None:
+        """A durable v3 chunk was persisted: update the screen only.
+
+        The DB is the record of truth for v3 output, so this deliberately does
+        NOT write to the legacy .cast (no dual-write). Broadcasting to viewers
+        is the caller's responsibility.
+        """
+        self.stream.feed(data.encode("utf-8", "replace"))
+
     # ---- live path ----
     def feed_output(self, data: str):
         """A chunk of PTY output arrived: update screen + record + (caller broadcasts)."""
         self.stream.feed(data.encode("utf-8", "replace"))
         self._record("o", data)
 
+    def queue_input(self, client_input_id: str, data: str) -> None:
+        """Remember input content until the connector confirms PTY delivery."""
+        if client_input_id not in self.delivered_input_ids:
+            self.pending_inputs.setdefault(client_input_id, data)
+
+    def acknowledge_input(self, client_input_id: str) -> bool:
+        """Record a queued input exactly once after connector acknowledgement."""
+        if client_input_id in self.delivered_input_ids:
+            return False
+        data = self.pending_inputs.pop(client_input_id, None)
+        if data is None:
+            return False
+        self.delivered_input_ids.add(client_input_id)
+        self._record("i", data)
+        return True
+
     def record_input(self, data: str):
+        """Legacy input recorder retained for pre-v3 callers."""
         self._record("i", data)
 
     def resize(self, cols: int, rows: int):
@@ -182,11 +237,23 @@ class LiveSession:
 
 
 class LiveRegistry:
-    def __init__(self):
+    def __init__(self, durable_loader=None):
         self._sessions: dict[str, LiveSession] = {}
+        # Optional callback: session_id -> list of [t, kind, data] events read
+        # from durable v3 storage. Kept as a callback so the registry never
+        # holds a long-lived request Session; it opens its own short-lived one.
+        self.durable_loader = durable_loader
 
     def get(self, session_id: str) -> LiveSession | None:
         return self._sessions.get(session_id)
+
+    def _load_durable(self, session_id: str):
+        if self.durable_loader is None:
+            return []
+        try:
+            return self.durable_loader(session_id) or []
+        except Exception:
+            return []
 
     def get_or_create(self, session_id: str, cols: int = DEFAULT_COLS,
                       rows: int = DEFAULT_ROWS) -> LiveSession:
@@ -194,13 +261,33 @@ class LiveRegistry:
         if ls is None:
             ls = LiveSession(session_id, cols, rows)
             # server restarted but session had prior history → rebuild screen
-            if ls.cast_path.exists() and ls.cast_path.stat().st_size > 0:
-                try:
+            # from both the legacy .cast history and durable v3 frames.
+            try:
+                if ls.cast_path.exists() and ls.cast_path.stat().st_size > 0:
                     ls.replay_into_screen()
-                except Exception:
-                    pass
+                ls.feed_durable_events(self._load_durable(session_id))
+            except Exception:
+                pass
             self._sessions[session_id] = ls
         return ls
+
+    def merged_events(self, session_id: str) -> list:
+        """Legacy .cast events followed by durable v3 events, each once.
+
+        Returns a list of [t, kind, data]. Deterministic order: all legacy
+        cast events first (as recorded), then durable frames in committed row
+        order with a monotonic clock. Used to serve a valid merged asciicast v2
+        recording without mutating the old .cast.
+        """
+        ls = self._sessions.get(session_id)
+        cast = ls.cast_events() if ls is not None else _read_cast_events(session_id)
+        durable = self._load_durable(session_id)
+        base = cast[-1][0] if cast else 0.0
+        merged = list(cast)
+        for ev in durable:
+            t = ev[0] if ev[0] is not None else 0.0
+            merged.append([round(base + float(t), 6), ev[1], ev[2]])
+        return merged
 
     def drop(self, session_id: str):
         ls = self._sessions.pop(session_id, None)
@@ -211,4 +298,46 @@ class LiveRegistry:
                 pass
 
 
+def _read_cast_events(session_id: str) -> list:
+    path = DATA_DIR / f"{session_id}.cast"
+    events: list = []
+    if not path.exists():
+        return events
+    with open(path, encoding="utf-8") as fp:
+        first = True
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            if first:
+                first = False
+                continue
+            try:
+                t, kind, data = json.loads(line)
+            except Exception:
+                continue
+            events.append([t, kind, data])
+    return events
+
+
 live_registry = LiveRegistry()
+
+
+def cast_header(session_id: str, cols: int = DEFAULT_COLS,
+                rows: int = DEFAULT_ROWS) -> dict:
+    ls = live_registry.get(session_id)
+    if ls is not None:
+        return {"version": 2, "width": ls.cols, "height": ls.rows,
+                "timestamp": int(ls.start_time), "env": {"TERM": "xterm-256color"}}
+    path = DATA_DIR / f"{session_id}.cast"
+    if path.exists():
+        with open(path, encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    try:
+                        return json.loads(line)
+                    except Exception:
+                        break
+    return {"version": 2, "width": cols, "height": rows,
+            "timestamp": int(time.time()), "env": {"TERM": "xterm-256color"}}

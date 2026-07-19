@@ -105,42 +105,27 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
 
 用户在自己机器上自启的进程。**智能和 API key 都在这里，server 永远看不到。**
 
-### 3.0 P2 Cut 4：Supervisor / Transport 拆分（本轮）
+### 3.0 P2 Cut 4：Supervisor / Transport 拆分
 connector 拆成两半，二者只经 IPC 抽象（`ipc.py`）通信：
-- **`supervisor.py`（sessiond）——会话所有权**：拥有全部 `PtySession` 生命周期，
-  `handle_control()` 处理 `open/input/resize/close/list_sessions`，PTY 输出写入内存
-  `pending` deque（缓冲），`drain_to(channel)` 发送 `ipc_delivery` 后，只有 transport 确认 WebSocket
-  `send()` 成功并回传 `ipc_delivery_ack` 才弹出队首；transport 在 ACK 前消失时，队首留给下一次 attach。
-  **完全不认识 WebSocket / server**。核心不变式：`detach()`（transport 断开/重启）
-  绝不 kill 任何 PTY，只有真正 `shutdown()`（supervisor 退出）才 kill。
-- **`transport.py`——WebSocket 传输**：`TransportSession` 只管网络，把 server 帧转给
-  supervisor（经 channel），把 supervisor 缓冲的 output 帧发回 server；成功发送后回本地 ACK，重启不触碰 PTY。
-  连接建立时先发 `list_sessions` 让 server resume 同一 PTY。若进程恰好在 server 已接收、但本地 ACK
-  尚未落回 supervisor 时崩溃，当前 Cut 4 允许重复发送而不允许静默丢帧；Cut 5 用持久序号/ACK 收敛为精确 resume。
-- **`ipc.py`——本地 IPC 抽象**：统一 `Channel` 协议 + 长度受限（`MAX_FRAME`=1 MiB）
-  的换行分隔 JSON 帧（`encode_frame`/`decode_frame`，永不 pickle）。默认用进程内
-  `LoopbackChannel`（一对 asyncio 队列，经真实帧编解码往返）把两半连在一个进程里，
-  保留 `python -m connector` 单进程形态。本轮还落地了真正的双进程传输
-  `StreamChannel` + `serve_channel()`/`connect_channel()`：`default_endpoint()` 计算平台地址——
-  **Windows** 命名管道 `\\\\.\\pipe\\deepbox-sessiond-<user>`（supervisor 为管道服务端，
-  每个 transport 为客户端，经 proactor `start_serving_pipe`/`connect_pipe`）；**POSIX** Unix 域
-  套接字 `$XDG_RUNTIME_DIR/deepbox/sessiond-<user>.sock`（绑定后 `chmod 0600`，仅当前用户可连）。
-  连接前有双向本地当前用户鉴权握手：supervisor 与 transport 各发 nonce，双方分别用角色隔离的
-  HMAC-SHA256 证明持有 `0600` 每用户密钥文件（`ensure_secret`/`read_secret`）；任一证明不符即断开，
-  每次握手读取还有 5 秒超时，避免未认证的本地连接长期占位。
-  ⚠️ 真实 ConPTY + 真实 Windows 服务长稳验证**仍未**执行（见 §8 真机验收门）；
-  但本机 Windows Proactor 命名管道 reconnect 已由单元测试实测通过。
-  `pending` deque 是 Cut 5 磁盘 spool 将替换的清晰接缝。
-- CLI 面：`python -m connector` 默认仍是 all-in-one（loopback 单进程，如实说明）；
-  `--mode supervisor`（sessiond，长驻、拥有 PTY、serve IPC、接受 transport 重连）与
-  `--mode transport`（拥有 WS、连接本地 sessiond、可独立重启、绝不 kill PTY）显式开启双进程拆分。
-  `--status` 打印协议/模式/IPC endpoint/endpoint 是否存在/密钥是否存在 JSON；
-  `--doctor` 额外打印上述 IPC 状态。启动 supervisor 时仅在探测确认无人监听后清理 POSIX 陈旧套接字
-  （`cleanup_stale_endpoint`）；每用户密钥保持稳定，不因重启或并发启动被截断/轮换。同一时刻只允许一个
-  transport 连接：supervisor 先回 `ipc_attached`，transport 再建立 WS；第二个连接收到 `ipc_busy` 后被拒。
-  supervisor 在绑定 IPC 前必须从 `/api/me` 取得 agent 元数据、校验 protocol 并上报 runtime；bootstrap 失败即退出，
-  不会以空 catalogue 静默把真实 agent 降级成 mock。
-  `Connector.status()` / `SessionSupervisor.status()` 给出 attached / sessions / pending_frames。
+- **`supervisor.py`（sessiond）——会话所有权**：拥有全部 `PtySession` 生命周期；`detach()` 只断开 transport，绝不 kill PTY；只有 `shutdown()` 才结束 PTY。每次新 PTY 启动生成一个 UUID `pty_instance_id`，同一 PTY 的幂等 `open` 复用该值，PTY 退出或终止时清除。
+- **`transport.py`——WebSocket 传输**：不拥有 PTY。`TransportSession` 在 IPC 与 `/ws/devbox` 之间转发帧，心跳和网络重连都不能改变 PTY 生命周期。
+- **IPC**：split 模式使用 Windows named pipe / POSIX `0600` Unix socket；消息为限制 1 MiB 的 newline-JSON，并有 HMAC 握手。all-in-one 模式使用相同 `Channel` 接口的 `LoopbackChannel`。
+
+### 3.0a P2 Cut 5：Protocol v3 durable spool、server ACK 与精确 resume
+
+Protocol v3 的输出身份是 `(session_id, pty_instance_id, seq)`：
+
+- **先落盘再发送**：`SessionSupervisor.emit()` 对 `output` 调用 `enqueue_output()`。`connector/spool.py` 的真实运行时 `DiskSpool` 使用 stdlib `sqlite3`，启用 WAL 和 `synchronous=FULL`；`outbox` 以三元组唯一约束保存 payload，`ack_state` 保存各 PTY 实例最后连续 ACK，`input_receipts` 保存输入去重 ID。单测可注入 `InMemorySpool`。
+- **序号域**：`seq` 在 `BEGIN IMMEDIATE` 事务中按 PTY 实例分配，取 `max(last_acked_seq, outbox max seq)+1`，从 1 开始且不复用。ready/presence/exit/input_ack 等控制帧只进进程内队列，既不占 PTY 输出序号，也不会在 sessiond 重启后陈旧重放。
+- **本地 FIFO**：`drain_to()` 优先发送进程内控制帧，再发送最旧 durable `ord`，并记录当前 `delivery_id`。只有匹配当前 in-flight 的 `ipc_delivery_ack` 才会推进；durable output 还必须仍是 spool 队首，SQLite ACK 只允许 `last_acked_seq+1`，事务提交后才删除 outbox 行。
+- **ACK 不是 `send()` 成功**：transport 在 `ws.send(output)` 前后都不会释放 output。它等待 server 返回完全匹配的 `{type:"ack", session_id, pty_instance_id, seq}`，然后才把本地 `ipc_delivery_ack` 发给 supervisor。陈旧/错配 ACK 被忽略；`resend.expected_seq` 等于当前 seq 时重发同一行，不一致或 server error 时 fail closed，保留 spool 给下一次连接。非 output 控制帧仍以 `ws.send()` 完成为本地发送边界。
+- **server 先持久化再 ACK**：`server/app/recording.py` 的 `RecordingStore` 把输出写入 `recording_frames` 并 commit 后才允许 `/ws/devbox` 回 ACK。相同三元组+相同 payload 是幂等 duplicate（重新 ACK、不重写）；payload 冲突返回 error；gap 返回 `resend(expected_seq)`，不推进 ACK。server 按 devbox/agent ownership 校验，不能跨机器写历史。
+- **断线恢复**：transport 在 server ACK 前崩溃、WebSocket 在 persist 后 ACK 前断开、或整机重启，outbox 行都仍在。CLI 用 `sha256(server_url + "
+" + token)[:16]` 选择用户私有 spool 路径，路径不包含 token；重连按 `ord` 重放，server 去重后精确 ACK。
+- **输入幂等**：browser input 缺少 ID 时 server 生成 UUID `client_input_id`；supervisor 在写 PTY 前通过 `input_receipts` 原子登记，同一 ID 重放不会二次写入。首次和 duplicate 都返回 `input_ack(status="delivered")`。server 只在收到 delivery ACK 后把该输入写入 cast，并把 ACK 转发给 session browser。
+- **可观测性**：`SessionSupervisor.status()` 返回 `pending_frames`、`pending_bytes`、各 PTY 实例 `last_acked_seq/next_seq` 以及当前 `pty_instance_id`。
+
+`open_spool(server_url, token)` 只在真实 CLI 模式注入；普通 `Connector(...)` / `SessionSupervisor(...)` 构造默认使用内存 spool，不会在单测或库调用时创建用户文件。server 仍只持有终端记录和非 secret 元数据，绝不接触模型或本地 API key。
 
 ### 3.1 `client.py` — 主循环（组合 supervisor + transport）
 1. `GET /api/me`（带 Bearer token）→ 拿到要跑的 agent 名单（runtime/cwd/launch_cmd）。
@@ -268,15 +253,16 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
 
 ## 8. 现在的边界
 
-- output 已写 asciicast DVR，并维护有限 scrollback；connector 断线时使用**内存** FIFO，但尚无
-  seq/ACK/磁盘 spool，不能声明严格零丢失。
+- output 已写 asciicast DVR，并维护有限 scrollback；connector 断线时使用**内存** FIFO 作前置去抖，
+  持久性由 **P2 Cut 5 磁盘 spool**（seq/ACK/fsync/resume）保证：每帧落盘后才可发送、精确 seq ACK 后才移除。
 - **P2 Cut 4 已拆分** supervisor（会话所有权）/ transport（WS）：transport 重启/断开不再 kill PTY。
   拆分既可跑在**进程内** `LoopbackChannel`（`python -m connector` 默认 all-in-one），
   也可跑真实**双进程**：`--mode supervisor` 长驻拥有 PTY 并经命名管道 / Unix socket（`0600`）
   serve IPC，`--mode transport` 拥有 WS 并可独立重连（本机 proactor 命名管道 reconnect 已单测实测通过）。
   依然：默认 all-in-one 进程整体退出仍 `shutdown()` kill 其托管 PTY；真实 Windows 服务形态
   下的 sessiond 长稳 + 真实 ConPTY 长稳验证尚未执行（见下方真机验收门）。
-- `SessionSupervisor.pending` 仍是内存 deque，是 **P2 Cut 5 磁盘 spool** 将替换的接缝。
+- **P2 Cut 5 已落地** `SessionSupervisor.pending` 由持久磁盘 spool 支撑（`connector/spool.py`，见 §3.0a）：
+  emit 落盘 fsync、单调 seq、精确 seq ACK 持久化后移除、重启按序重放未 ACK 帧、尾部半条截断 / 内部损坏 fail closed。
 
 ### 8a. P2 Cut 4 真机验收门（尚未执行）
 

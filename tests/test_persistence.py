@@ -25,24 +25,28 @@ class RecordingWebSocket:
 class ConnectorBufferTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_ws_send_keeps_frame_for_next_connection(self):
         connector = Connector("http://unused", "token")
-        frame = {"type": "output", "session_id": "s1", "data": "important"}
+        frame = {"type": "output", "session_id": "s1",
+                 "pty_instance_id": "p1", "data": "important"}
         await connector.send(frame)
 
         with self.assertRaises(ConnectionError):
             await connector._sender(FailingWebSocket())
-        self.assertEqual(list(connector.pending), [frame])
+        pending = list(connector.pending)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["data"], "important")
+        self.assertEqual(pending[0]["seq"], 1)
 
         healthy = RecordingWebSocket()
         task = asyncio.create_task(connector._sender(healthy))
         for _ in range(20):
-            if not connector.pending:
+            if healthy.frames:
                 break
             await asyncio.sleep(0)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
         self.assertEqual(len(healthy.frames), 1)
-        self.assertEqual(len(connector.pending), 0)
+        self.assertEqual(len(connector.pending), 1)
 
     async def test_idle_connection_emits_protocol_heartbeat(self):
         socket = RecordingWebSocket()
@@ -77,6 +81,26 @@ class ScreenRestoreTests(unittest.TestCase):
             live.feed_output("persistent hello")
             self.assertIn("persistent hello", live.restore_bytes())
             self.assertIn("persistent hello", live.cast_path.read_text(encoding="utf-8"))
+        finally:
+            live.mark_ended(0)
+            live.cast_path.unlink(missing_ok=True)
+
+    def test_input_is_recorded_once_only_after_delivery_ack(self):
+        sid = "test-" + uuid.uuid4().hex
+        live = LiveSession(sid, 40, 5)
+        try:
+            live.queue_input("input-1", "echo durable\r")
+            before = live.cast_path.read_text(encoding="utf-8")
+            self.assertNotIn("echo durable", before)
+
+            self.assertTrue(live.acknowledge_input("input-1"))
+            self.assertFalse(live.acknowledge_input("input-1"))
+            after = live.cast_path.read_text(encoding="utf-8")
+            input_events = [
+                json.loads(line) for line in after.splitlines()[1:]
+                if line.strip() and json.loads(line)[1] == "i"
+            ]
+            self.assertEqual([event[2] for event in input_events], ["echo durable\r"])
         finally:
             live.mark_ended(0)
             live.cast_path.unlink(missing_ok=True)
