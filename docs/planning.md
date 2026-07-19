@@ -542,7 +542,12 @@ Server 只把 capability 当 opaque JSON blob 存储/转发。
 
 ---
 
-## Cut 8 — Workspace、权限与协作
+## Cut 8 — Workspace、权限与协作 ✅ 已实现
+
+> **进度（2026-07）**：Organization → Workspace → Membership 数据层、personal workspace
+> 自动创建、既有 Devbox/Session 回填、四级角色授权、多观看者广播和 60 秒 keyboard lease 已落地。
+> Operator 以上可请求控制权；当前 holder 可 handoff；Viewer 始终只读。REST/WS 集成测试覆盖共享资源、
+> 只读拒绝、owner 不变量和租约竞争。真实多浏览器/多机器验收仍随 P1 Cut 2 一起执行。
 
 ### 数据模型
 

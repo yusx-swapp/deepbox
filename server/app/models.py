@@ -16,6 +16,13 @@ ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
 VALID_ROLES = {ROLE_OWNER, ROLE_MEMBER}
 
+# Collaboration membership roles (Cut 8), ordered least->most privileged.
+WS_ROLE_VIEWER = "viewer"
+WS_ROLE_OPERATOR = "operator"
+WS_ROLE_ADMIN = "admin"
+WS_ROLE_OWNER = "owner"
+VALID_WS_ROLES = {WS_ROLE_VIEWER, WS_ROLE_OPERATOR, WS_ROLE_ADMIN, WS_ROLE_OWNER}
+
 # Session-level recording retention policies.
 RETENTION_NONE = "none"          # keep no durable payload (redact eagerly)
 RETENTION_7D = "7d"
@@ -61,6 +68,8 @@ class Devbox(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
     last_seen_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    workspace_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workspace.id", ondelete="SET NULL"), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="devboxes")
     tokens: Mapped[list["Token"]] = relationship(
@@ -105,6 +114,8 @@ class Session(Base):
     title: Mapped[str] = mapped_column(String, default="Session")
     # Recording retention policy: none|7d|30d|permanent (see VALID_RETENTIONS).
     retention: Mapped[str] = mapped_column(String, default=RETENTION_30D)
+    workspace_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workspace.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
 
@@ -206,6 +217,79 @@ class RecordingCheckpoint(Base):
     rows: Mapped[int] = mapped_column(Integer, default=24)
     screen: Mapped[str] = mapped_column(Text)  # rendered terminal snapshot
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+
+class Organization(Base):
+    __tablename__ = "organization"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    is_personal: Mapped[bool] = mapped_column(Integer, default=0)
+    owner_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+    workspaces: Mapped[list["Workspace"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan")
+
+
+class Workspace(Base):
+    __tablename__ = "workspace"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(
+        ForeignKey("organization.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String)
+    is_personal: Mapped[bool] = mapped_column(Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+    organization: Mapped[Organization] = relationship(back_populates="workspaces")
+    memberships: Mapped[list["Membership"]] = relationship(
+        back_populates="workspace", cascade="all, delete-orphan")
+
+
+class Membership(Base):
+    __tablename__ = "membership"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", name="uq_membership_ws_user"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspace.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String, default=WS_ROLE_VIEWER)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+    workspace: Mapped[Workspace] = relationship(back_populates="memberships")
+
+
+class SessionParticipant(Base):
+    __tablename__ = "session_participant"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "user_id", name="uq_session_participant"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String, default=WS_ROLE_VIEWER)
+    joined_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+
+class KeyboardLease(Base):
+    """Exclusive keyboard-control lease for a session (single holder)."""
+    __tablename__ = "keyboard_lease"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), unique=True, index=True)
+    holder_user_id: Mapped[str] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"))
+    acquired_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 SessionLocal: sessionmaker | None = None
 
 
@@ -246,6 +330,83 @@ def _migrate(engine) -> None:
         if "redacted_at" not in frame_cols:
             stmts.append(
                 "ALTER TABLE recording_frame ADD COLUMN redacted_at DATETIME")
+    if "devbox" in inspector.get_table_names():
+        devbox_cols = {c["name"] for c in inspector.get_columns("devbox")}
+        if "workspace_id" not in devbox_cols:
+            stmts.append("ALTER TABLE devbox ADD COLUMN workspace_id VARCHAR")
+    if "session" in inspector.get_table_names():
+        session_cols = {c["name"] for c in inspector.get_columns("session")}
+        if "workspace_id" not in session_cols:
+            stmts.append("ALTER TABLE session ADD COLUMN workspace_id VARCHAR")
+    if "keyboard_lease" in inspector.get_table_names():
+        lease_cols = {c["name"] for c in inspector.get_columns("keyboard_lease")}
+        if "version" not in lease_cols:
+            stmts.append("ALTER TABLE keyboard_lease ADD COLUMN version INTEGER DEFAULT 1")
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))
+    _backfill_workspaces(engine)
+
+
+def _backfill_workspaces(engine) -> None:
+    """Idempotently ensure every Devbox owner has a personal org/workspace and
+    every Devbox/Session is assigned a workspace_id."""
+    session = sessionmaker(bind=engine, expire_on_commit=False)()
+    try:
+        import uuid as _uuid
+
+        # One personal org/workspace/membership per Devbox owner.
+        owner_ws: dict[str, str] = {}
+        owner_ids = {
+            row[0] for row in session.query(Devbox.owner_user_id).distinct()
+        }
+        for uid in owner_ids:
+            ws = (
+                session.query(Workspace)
+                .filter(Workspace.is_personal == 1)
+                .join(Organization, Workspace.org_id == Organization.id)
+                .filter(Organization.owner_user_id == uid)
+                .first()
+            )
+            if ws is None:
+                org = Organization(
+                    id=str(_uuid.uuid4()), name="Personal",
+                    is_personal=1, owner_user_id=uid)
+                session.add(org)
+                session.flush()
+                ws = Workspace(
+                    id=str(_uuid.uuid4()), org_id=org.id,
+                    name="Personal", is_personal=1)
+                session.add(ws)
+                session.flush()
+            exists = (
+                session.query(Membership)
+                .filter_by(workspace_id=ws.id, user_id=uid)
+                .first()
+            )
+            if exists is None:
+                session.add(Membership(
+                    id=str(_uuid.uuid4()), workspace_id=ws.id,
+                    user_id=uid, role=WS_ROLE_OWNER))
+            owner_ws[uid] = ws.id
+
+        # Backfill Devbox.workspace_id.
+        for db in session.query(Devbox).filter(Devbox.workspace_id.is_(None)):
+            ws_id = owner_ws.get(db.owner_user_id)
+            if ws_id is not None:
+                db.workspace_id = ws_id
+
+        session.flush()
+
+        # Backfill Session.workspace_id via agent -> devbox.
+        for sess in session.query(Session).filter(Session.workspace_id.is_(None)):
+            agent = session.query(Agent).filter_by(id=sess.agent_id).first()
+            if agent is None:
+                continue
+            devbox = session.query(Devbox).filter_by(id=agent.devbox_id).first()
+            if devbox is not None and devbox.workspace_id is not None:
+                sess.workspace_id = devbox.workspace_id
+
+        session.commit()
+    finally:
+        session.close()

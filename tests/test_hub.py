@@ -44,6 +44,27 @@ class HubUserDisconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("other-box", hub.devboxes)
         self.assertEqual(hub.agent_to_devbox["other-agent"], "other-box")
 
+    async def test_disconnect_user_sessions_is_scoped_to_selected_sessions(self):
+        hub = Hub()
+        selected_ws = FakeWebSocket()
+        other_session_ws = FakeWebSocket()
+        other_user_ws = FakeWebSocket()
+        selected = HumanConn(ws=selected_ws, user_id="target", sessions={"s1": "a1"})
+        other_session = HumanConn(ws=other_session_ws, user_id="target", sessions={"s2": "a2"})
+        other_user = HumanConn(ws=other_user_ws, user_id="other", sessions={"s1": "a1"})
+        for conn in (selected, other_session, other_user):
+            hub.add_human(conn)
+
+        count = await hub.disconnect_user_sessions("target", {"s1"})
+
+        self.assertEqual(count, 1)
+        self.assertEqual(selected_ws.close_codes, [4001])
+        self.assertEqual(other_session_ws.close_codes, [])
+        self.assertEqual(other_user_ws.close_codes, [])
+        self.assertNotIn(selected, hub.humans)
+        self.assertIn(other_session, hub.humans)
+        self.assertIn(other_user, hub.humans)
+
 
 if __name__ == "__main__":
     unittest.main()

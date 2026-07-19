@@ -16,13 +16,16 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from . import models
 from .models import (
     User, Devbox, Token, Agent, Session, Message, BootstrapState, Invitation,
+    Organization, Workspace, Membership, SessionParticipant, KeyboardLease,
     PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
+    WS_ROLE_OWNER, WS_ROLE_ADMIN, WS_ROLE_OPERATOR, WS_ROLE_VIEWER,
+    VALID_WS_ROLES,
 )
 from .util import (
     new_id, new_token, hash_token, hash_password, verify_password_ex,
@@ -34,6 +37,11 @@ from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID
 from .logging import configure_logging, log_event
 from .capacity import collect_capacity, transition_event
 from .audit import audit_event
+from .collaboration import (
+    LeaseConflict, LeaseError, PermissionDenied, acquire_keyboard_lease, can_control,
+    get_keyboard_lease, get_role, handoff_keyboard_lease, list_user_workspaces,
+    release_keyboard_lease, renew_keyboard_lease, require_workspace_access, role_at_least,
+)
 from .security import (
     SAFE_METHODS, RateLimiter, RateLimitRule, build_security_headers,
     is_origin_allowed,
@@ -524,14 +532,187 @@ async def enable_user(user_id: str, request: Request, s: OrmSession = Depends(db
 
 
 # ---------------------------------------------------------------- devbox mgmt
+@app.get("/api/workspaces")
+async def list_workspaces(request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    rows = list_user_workspaces(s, u.id)
+    if not rows:
+        rows = [_ensure_personal_workspace(s, u)]
+        s.commit()
+    return [{"id": w.id, "name": w.name, "org_id": w.org_id,
+             "role": get_role(s, w.id, u.id), "is_personal": bool(w.is_personal)}
+            for w in rows]
+
+
+@app.post("/api/workspaces")
+async def create_workspace(request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    body = await request.json()
+    name = str(body.get("name") or "Workspace").strip()[:120]
+    org = Organization(id=new_id(), name=name, owner_user_id=u.id)
+    workspace = Workspace(id=new_id(), org_id=org.id, name=name)
+    s.add_all([org, workspace, Membership(id=new_id(), workspace_id=workspace.id,
+                                          user_id=u.id, role=WS_ROLE_OWNER)])
+    s.commit()
+    audit_event("workspace.created", actor_user_id=u.id,
+                resource_type="workspace", resource_id=workspace.id)
+    return {"id": workspace.id, "name": workspace.name, "role": WS_ROLE_OWNER}
+
+
+@app.get("/api/workspaces/{workspace_id}/members")
+async def list_workspace_members(workspace_id: str, request: Request,
+                                 s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    _require_workspace(s, u.id, workspace_id)
+    rows = s.execute(select(Membership, User).join(User, User.id == Membership.user_id)
+                     .where(Membership.workspace_id == workspace_id)
+                     .order_by(User.username)).all()
+    return [{"user_id": m.user_id, "username": user.username, "role": m.role}
+            for m, user in rows]
+
+
+@app.post("/api/workspaces/{workspace_id}/members")
+async def add_workspace_member(workspace_id: str, request: Request,
+                               s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    actor_role = _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    body = await request.json()
+    role = body.get("role", WS_ROLE_VIEWER)
+    if role not in VALID_WS_ROLES or (role == WS_ROLE_OWNER and actor_role != WS_ROLE_OWNER):
+        raise HTTPException(422, "invalid role")
+    target = s.scalar(select(User).where(User.username == str(body.get("username", "")).strip()))
+    if not target:
+        raise HTTPException(404, "not found")
+    if get_role(s, workspace_id, target.id):
+        raise HTTPException(409, "already a member")
+    s.add(Membership(id=new_id(), workspace_id=workspace_id, user_id=target.id, role=role))
+    s.commit()
+    audit_event("workspace.member_added", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace_id,
+                details={"target_user_id": target.id, "role": role})
+    return {"user_id": target.id, "username": target.username, "role": role}
+
+
+@app.patch("/api/workspaces/{workspace_id}/members/{user_id}")
+async def update_workspace_member(workspace_id: str, user_id: str, request: Request,
+                                  s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    actor_role = _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    membership = s.scalar(select(Membership).where(
+        Membership.workspace_id == workspace_id, Membership.user_id == user_id))
+    if not membership:
+        raise HTTPException(404, "not found")
+    body = await request.json()
+    role = body.get("role")
+    if role not in VALID_WS_ROLES:
+        raise HTTPException(422, "invalid role")
+    if (membership.role == WS_ROLE_OWNER or role == WS_ROLE_OWNER) and actor_role != WS_ROLE_OWNER:
+        raise HTTPException(403, "owner role required")
+    previous = membership.role
+    if previous == WS_ROLE_OWNER and role != WS_ROLE_OWNER:
+        owners = s.scalar(select(func.count()).select_from(Membership).where(
+            Membership.workspace_id == workspace_id, Membership.role == WS_ROLE_OWNER))
+        if owners <= 1:
+            raise HTTPException(409, "workspace must keep an owner")
+    session_ids = set(s.scalars(select(Session.id).where(
+        Session.workspace_id == workspace_id)).all())
+    membership.role = role
+    s.commit()
+    await hub.disconnect_user_sessions(user_id, session_ids)
+    audit_event("workspace.role_changed", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace_id,
+                details={"target_user_id": user_id, "from": previous, "to": role})
+    return {"user_id": user_id, "role": role}
+
+
+@app.delete("/api/workspaces/{workspace_id}/members/{user_id}")
+async def remove_workspace_member(workspace_id: str, user_id: str, request: Request,
+                                  s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    actor_role = _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    membership = s.scalar(select(Membership).where(
+        Membership.workspace_id == workspace_id, Membership.user_id == user_id))
+    if not membership:
+        raise HTTPException(404, "not found")
+    if membership.role == WS_ROLE_OWNER and actor_role != WS_ROLE_OWNER:
+        raise HTTPException(403, "owner role required")
+    if membership.role == WS_ROLE_OWNER:
+        owners = s.scalar(select(func.count()).select_from(Membership).where(
+            Membership.workspace_id == workspace_id, Membership.role == WS_ROLE_OWNER))
+        if owners <= 1:
+            raise HTTPException(409, "workspace must keep an owner")
+    session_ids = set(s.scalars(select(Session.id).where(
+        Session.workspace_id == workspace_id)).all())
+    s.delete(membership)
+    s.commit()
+    await hub.disconnect_user_sessions(user_id, session_ids)
+    audit_event("workspace.member_removed", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace_id,
+                details={"target_user_id": user_id})
+    return {"ok": True}
+
+
 def _agent_json(a: Agent) -> dict:
     return {"id": a.id, "handle": a.handle, "display_name": a.display_name,
             "runtime": a.runtime, "cwd": a.cwd, "launch_cmd": a.launch_cmd,
             "presence": "online" if hub.is_agent_online(a.id) else a.presence}
 
 
+def _ensure_personal_workspace(s: OrmSession, u: User) -> Workspace:
+    membership = s.scalar(select(Membership).where(Membership.user_id == u.id)
+                          .order_by(Membership.created_at))
+    if membership:
+        return s.get(Workspace, membership.workspace_id)
+    org = Organization(id=new_id(), name=f"{u.username} personal",
+                       is_personal=True, owner_user_id=u.id)
+    workspace = Workspace(id=new_id(), org_id=org.id, name="Personal",
+                          is_personal=True)
+    s.add_all([org, workspace, Membership(id=new_id(), workspace_id=workspace.id,
+                                          user_id=u.id, role=WS_ROLE_OWNER)])
+    s.flush()
+    return workspace
+
+
+def _require_workspace(s: OrmSession, user_id: str, workspace_id: str,
+                       minimum: str = WS_ROLE_VIEWER) -> str:
+    try:
+        return require_workspace_access(s, workspace_id, user_id, minimum)
+    except PermissionDenied:
+        raise HTTPException(404, "not found")
+
+
+def _devbox_role(s: OrmSession, user_id: str, d: Devbox,
+                 minimum: str = WS_ROLE_VIEWER) -> str:
+    if not d.workspace_id:
+        if d.owner_user_id == user_id:
+            return WS_ROLE_OWNER
+        raise HTTPException(404, "not found")
+    return _require_workspace(s, user_id, d.workspace_id, minimum)
+
+
+def _session_role(s: OrmSession, user_id: str, sess: Session,
+                  minimum: str = WS_ROLE_VIEWER) -> str:
+    if sess.workspace_id:
+        return _require_workspace(s, user_id, sess.workspace_id, minimum)
+    if sess.user_id == user_id:
+        return WS_ROLE_OWNER
+    raise HTTPException(404, "not found")
+
+
+def _lease_json(s: OrmSession, sess: Session, user_id: str, role: str) -> dict:
+    lease = get_keyboard_lease(s, sess.id)
+    active = bool(lease and lease.expires_at > now())
+    holder = s.get(User, lease.holder_user_id) if active else None
+    return {"type": "collaboration", "session_id": sess.id, "role": role,
+            "keyboard": {"holder_user_id": lease.holder_user_id if active else None,
+                         "holder_username": holder.username if holder else None,
+                         "expires_at": lease.expires_at.isoformat() if active else None,
+                         "is_holder": bool(active and lease.holder_user_id == user_id),
+                         "can_request": can_control(role)}}
+
+
 def _devbox_json(d: Devbox) -> dict:
-    return {"id": d.id, "name": d.name,
+    return {"id": d.id, "name": d.name, "workspace_id": d.workspace_id,
             "online": d.id in hub.devboxes,
             "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             "capabilities": d.capabilities,
@@ -542,29 +723,41 @@ def _devbox_json(d: Devbox) -> dict:
 async def create_devbox(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     body = await request.json()
-    d = Devbox(id=new_id(), owner_user_id=u.id, name=body.get("name") or "My Devbox")
+    workspace_id = body.get("workspace_id")
+    if workspace_id:
+        _require_workspace(s, u.id, workspace_id, WS_ROLE_ADMIN)
+        workspace = s.get(Workspace, workspace_id)
+    else:
+        workspace = _ensure_personal_workspace(s, u)
+    d = Devbox(id=new_id(), owner_user_id=u.id, workspace_id=workspace.id,
+               name=body.get("name") or "My Devbox")
     s.add(d)
     full, h, preview = new_token()
     s.add(Token(id=new_id(), devbox_id=d.id, hash=h, preview=preview))
     s.commit()
     audit_event("devbox.created", actor_user_id=u.id,
-                resource_type="devbox", resource_id=d.id)
+                resource_type="devbox", resource_id=d.id,
+                details={"workspace_id": workspace.id})
     return {"devbox": _devbox_json(d), "token": full, "token_preview": preview}
 
 
 @app.get("/api/devboxes")
 async def list_devboxes(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
-    rows = s.scalars(select(Devbox).where(Devbox.owner_user_id == u.id)).all()
-    return [_devbox_json(d) for d in rows]
+    workspace_ids = select(Membership.workspace_id).where(Membership.user_id == u.id)
+    rows = s.scalars(select(Devbox).where(Devbox.workspace_id.in_(workspace_ids))).all()
+    legacy = s.scalars(select(Devbox).where(Devbox.workspace_id.is_(None),
+                                             Devbox.owner_user_id == u.id)).all()
+    return [_devbox_json(d) for d in [*rows, *legacy]]
 
 
 @app.delete("/api/devboxes/{devbox_id}")
 async def delete_devbox(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
-    if not d or d.owner_user_id != u.id:
+    if not d:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     s.delete(d)
     s.commit()
     return {"ok": True}
@@ -581,8 +774,9 @@ def _token_json(token: Token) -> dict:
 async def list_tokens(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
-    if not d or d.owner_user_id != u.id:
+    if not d:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     rows = s.scalars(select(Token).where(Token.devbox_id == d.id)
                      .order_by(Token.created_at.desc())).all()
     return [_token_json(row) for row in rows]
@@ -592,8 +786,9 @@ async def list_tokens(devbox_id: str, request: Request, s: OrmSession = Depends(
 async def rotate_token(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
-    if not d or d.owner_user_id != u.id:
+    if not d:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     issued_at = now()
     for token in s.scalars(select(Token).where(
             Token.devbox_id == d.id, Token.revoked_at.is_(None))).all():
@@ -614,8 +809,9 @@ async def revoke_token(devbox_id: str, token_id: str, request: Request,
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
     token = s.get(Token, token_id)
-    if not d or d.owner_user_id != u.id or not token or token.devbox_id != d.id:
+    if not d or not token or token.devbox_id != d.id:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     if token.revoked_at is None:
         token.revoked_at = now()
         s.commit()
@@ -630,8 +826,9 @@ async def revoke_token(devbox_id: str, token_id: str, request: Request,
 async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
-    if not d or d.owner_user_id != u.id:
+    if not d:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     body = await request.json()
     a = Agent(
         id=new_id(), devbox_id=d.id,
@@ -648,8 +845,9 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
 async def delete_agent(agent_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     a = s.get(Agent, agent_id)
-    if not a or a.devbox.owner_user_id != u.id:
+    if not a:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
     s.delete(a)
     s.commit()
     return {"ok": True}
@@ -663,10 +861,11 @@ async def list_agent_sessions(agent_id: str, request: Request,
     create a new terminal and hide the persisted one."""
     u = current_user(request, s)
     a = s.get(Agent, agent_id)
-    if not a or a.devbox.owner_user_id != u.id:
+    if not a:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox)
     rows = s.scalars(select(Session).where(
-        Session.user_id == u.id, Session.agent_id == agent_id
+        Session.agent_id == agent_id
     ).order_by(Session.created_at.desc())).all()
     result = []
     for sess in rows:
@@ -684,10 +883,11 @@ async def list_agent_sessions(agent_id: str, request: Request,
 async def create_session(agent_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     a = s.get(Agent, agent_id)
-    if not a or a.devbox.owner_user_id != u.id:
+    if not a:
         raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox, WS_ROLE_OPERATOR)
     sess = Session(id=new_id(), user_id=u.id, agent_id=a.id,
-                   title=f"{a.display_name} session")
+                   workspace_id=a.devbox.workspace_id, title=f"{a.display_name} session")
     s.add(sess)
     s.commit()
     return {"id": sess.id, "agent_id": a.id, "title": sess.title}
@@ -697,8 +897,9 @@ async def create_session(agent_id: str, request: Request, s: OrmSession = Depend
 async def session_messages(session_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     sess = s.get(Session, session_id)
-    if not sess or sess.user_id != u.id:
+    if not sess:
         raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess)
     rows = s.scalars(select(Message).where(Message.session_id == session_id)
                      .order_by(Message.created_at)).all()
     return [{"id": m.id, "author_kind": m.author_kind, "author_id": m.author_id,
@@ -714,8 +915,9 @@ async def session_recording(session_id: str, request: Request, s: OrmSession = D
     """
     u = current_user(request, s)
     sess = s.get(Session, session_id)
-    if not sess or sess.user_id != u.id:
+    if not sess:
         raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess)
     from .live import cast_header, DATA_DIR
     from fastapi.responses import PlainTextResponse
     merged = live_registry.merged_events(session_id)
@@ -740,8 +942,9 @@ async def session_replay(session_id: str, request: Request,
     """
     u = current_user(request, s)
     sess = s.get(Session, session_id)
-    if not sess or sess.user_id != u.id:
+    if not sess:
         raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess)
     from .live import cast_header
 
     header = cast_header(session_id)
@@ -799,8 +1002,9 @@ async def erase_session_recording(session_id: str, request: Request,
                                   s: OrmSession = Depends(db)):
     u = current_user(request, s)
     sess = s.get(Session, session_id)
-    if not sess or sess.user_id != u.id:
+    if not sess:
         raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess, WS_ROLE_ADMIN)
     result = recording_store.secure_erase(s, session_id)
     audit_event("recording.erased", actor_user_id=u.id,
                 resource_type="session", resource_id=session_id,
@@ -820,8 +1024,9 @@ async def update_session_retention(session_id: str, request: Request,
     """Update a session's recording retention policy and enforce it now."""
     u = current_user(request, s)
     sess = s.get(Session, session_id)
-    if not sess or sess.user_id != u.id:
+    if not sess:
         raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess, WS_ROLE_ADMIN)
     try:
         body = await request.json()
     except Exception:
@@ -1021,6 +1226,17 @@ async def ws_devbox(ws: WebSocket):
         s.close()
 
 
+async def _broadcast_collaboration(s: OrmSession, sess: Session) -> None:
+    for watcher in list(hub.session_watchers.get(sess.id, set())):
+        role = get_role(s, sess.workspace_id, watcher.user_id) if sess.workspace_id else (
+            WS_ROLE_OWNER if sess.user_id == watcher.user_id else None)
+        if role:
+            try:
+                await watcher.ws.send_json(_lease_json(s, sess, watcher.user_id, role))
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------- WS: human (terminal)
 @app.websocket("/ws/term")
 async def ws_term(ws: WebSocket):
@@ -1055,15 +1271,36 @@ async def ws_term(ws: WebSocket):
             t = frame.get("type")
             if t in ("attach", "open"):  # 'open' kept for back-compat
                 sess = s.get(Session, frame["session_id"])
-                if not sess or sess.user_id != uid:
+                try:
+                    role = _session_role(s, uid, sess) if sess else None
+                except HTTPException:
+                    role = None
+                if not sess or not role:
                     await ws.send_json({"type": "error", "message": "no such session"})
                     continue
+                participant = s.scalar(select(SessionParticipant).where(
+                    SessionParticipant.session_id == sess.id,
+                    SessionParticipant.user_id == uid))
+                if participant:
+                    participant.last_seen_at = now()
+                    participant.role = role
+                else:
+                    s.add(SessionParticipant(id=new_id(), session_id=sess.id,
+                                             user_id=uid, role=role))
+                lease = get_keyboard_lease(s, sess.id)
+                if can_control(role) and (not lease or lease.expires_at <= now()):
+                    acquire_keyboard_lease(s, sess.id, uid, role)
+                    audit_event("keyboard.acquired", actor_user_id=uid,
+                                resource_type="session", resource_id=sess.id,
+                                details={"reason": "initial_attach"})
+                s.commit()
                 cols = frame.get("cols", 120)
                 rows = frame.get("rows", 30)
                 # ensure a LiveSession exists (rebuilds screen from .cast if server restarted)
                 ls = live_registry.get_or_create(sess.id, cols, rows)
                 ls.subscribers.add(conn)
                 hub.watch(conn, sess.id, sess.agent_id)
+                await _broadcast_collaboration(s, sess)
                 # 1) instantly restore the current screen for this viewer
                 await ws.send_json({"type": "restore", "session_id": sess.id,
                                     "data": ls.restore_bytes()})
@@ -1077,10 +1314,89 @@ async def ws_term(ws: WebSocket):
                     "session_id": sess.id, "cols": cols, "rows": rows})
                 await ws.send_json({"type": "status", "session_id": sess.id,
                                     "state": "live" if ok else "offline"})
+            elif t == "keyboard_acquire":
+                sid = frame.get("session_id")
+                sess = s.get(Session, sid)
+                try:
+                    role = _session_role(s, uid, sess, WS_ROLE_OPERATOR) if sess else None
+                    acquire_keyboard_lease(s, sid, uid, role)
+                    s.commit()
+                    audit_event("keyboard.acquired", actor_user_id=uid,
+                                resource_type="session", resource_id=sid,
+                                details={"reason": "requested"})
+                    await _broadcast_collaboration(s, sess)
+                except (HTTPException, PermissionDenied, LeaseConflict) as exc:
+                    s.rollback()
+                    if isinstance(exc, LeaseConflict) and sess:
+                        requester = s.get(User, uid)
+                        await hub.to_session_humans(sid, {
+                            "type": "keyboard_request", "session_id": sid,
+                            "requester_user_id": uid,
+                            "requester_username": requester.username if requester else "collaborator",
+                        })
+                        audit_event("keyboard.requested", actor_user_id=uid,
+                                    resource_type="session", resource_id=sid)
+                    await ws.send_json({"type": "error", "code": "keyboard_busy",
+                                        "message": str(getattr(exc, "detail", exc))})
+            elif t == "keyboard_renew":
+                sid = frame.get("session_id", "")
+                sess = s.get(Session, sid)
+                try:
+                    if not sess:
+                        raise PermissionDenied("unknown session")
+                    _session_role(s, uid, sess, WS_ROLE_OPERATOR)
+                    renew_keyboard_lease(s, sid, uid)
+                    await _broadcast_collaboration(s, sess)
+                except (HTTPException, LeaseError, PermissionDenied) as exc:
+                    s.rollback()
+                    await ws.send_json({"type": "error", "code": "keyboard_renew_failed",
+                                        "message": str(getattr(exc, "detail", exc))})
+            elif t == "keyboard_release":
+                sid = frame.get("session_id")
+                sess = s.get(Session, sid)
+                released = release_keyboard_lease(s, sid, uid) if sess else False
+                s.commit()
+                if released:
+                    audit_event("keyboard.released", actor_user_id=uid,
+                                resource_type="session", resource_id=sid)
+                    await _broadcast_collaboration(s, sess)
+            elif t == "keyboard_handoff":
+                sid = frame.get("session_id")
+                target_user_id = frame.get("target_user_id")
+                sess = s.get(Session, sid)
+                try:
+                    if not sess:
+                        raise PermissionDenied("unknown session")
+                    target_role = _session_role(s, target_user_id, sess, WS_ROLE_OPERATOR)
+                    handoff_keyboard_lease(s, sid, uid, target_user_id, target_role)
+                    audit_event("keyboard.handed_off", actor_user_id=uid,
+                                resource_type="session", resource_id=sid,
+                                details={"from_user_id": uid, "to_user_id": target_user_id})
+                    await _broadcast_collaboration(s, sess)
+                except (HTTPException, LeaseError, PermissionDenied) as exc:
+                    s.rollback()
+                    await ws.send_json({"type": "error", "code": "keyboard_handoff_failed",
+                                        "message": str(getattr(exc, "detail", exc))})
             elif t == "input":
                 sid = frame.get("session_id")
                 agent_id = conn.sessions.get(sid)
                 if agent_id:
+                    sess = s.get(Session, sid)
+                    try:
+                        role = _session_role(s, uid, sess, WS_ROLE_OPERATOR)
+                    except HTTPException:
+                        await ws.send_json({"type": "error", "code": "read_only",
+                                            "message": "viewer access is read-only"})
+                        continue
+                    lease = get_keyboard_lease(s, sid)
+                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                        await ws.send_json({"type": "error", "code": "keyboard_lease_required",
+                                            "message": "request keyboard control before typing"})
+                        if sess:
+                            await _broadcast_collaboration(s, sess)
+                        continue
+                    renew_keyboard_lease(s, sid, uid)
+                    s.commit()
                     raw_input_id = frame.get("client_input_id") or str(uuid4())
                     try:
                         client_input_id = str(UUID(str(raw_input_id)))
@@ -1102,6 +1418,9 @@ async def ws_term(ws: WebSocket):
                 sid = frame.get("session_id")
                 agent_id = conn.sessions.get(sid)
                 if agent_id:
+                    lease = get_keyboard_lease(s, sid)
+                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                        continue
                     ls = live_registry.get(sid)
                     if ls:
                         ls.resize(frame.get("cols", 120), frame.get("rows", 30))
@@ -1117,8 +1436,21 @@ async def ws_term(ws: WebSocket):
                 sid = frame.get("session_id")
                 agent_id = conn.sessions.get(sid)
                 if agent_id:
+                    sess = s.get(Session, sid)
+                    try:
+                        _session_role(s, uid, sess, WS_ROLE_OPERATOR)
+                    except HTTPException:
+                        await ws.send_json({"type": "error", "message": "terminate not allowed"})
+                        continue
+                    lease = get_keyboard_lease(s, sid)
+                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                        await ws.send_json({"type": "error", "code": "keyboard_lease_required",
+                                            "message": "keyboard holder controls termination"})
+                        continue
                     await hub.to_devbox(agent_id, {
                         "type": "terminate", "agent_id": agent_id, "session_id": sid})
+                    audit_event("session.terminated", actor_user_id=uid,
+                                resource_type="session", resource_id=sid)
     except WebSocketDisconnect:
         pass
     finally:

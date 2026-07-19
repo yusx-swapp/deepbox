@@ -14,6 +14,12 @@ There are exactly two roles:
 
 The first bootstrap user is an `owner`. Every invitee is a `member`.
 
+These are **account administration roles**, distinct from Cut 8 workspace roles. Every user gets a
+personal workspace with workspace role `owner`; a workspace owner/admin can add existing enabled
+users as `viewer`, `operator`, `admin`, or `owner`. Workspace roles control resource visibility and
+terminal input, but never grant global invitation/user administration. See
+[`implementation.md`](implementation.md#72-cut-8workspace角色与协作).
+
 ### Upgrading a pre-onboarding database
 
 The additive migration gives legacy users the `member` role; it deliberately does

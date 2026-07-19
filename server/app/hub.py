@@ -114,6 +114,23 @@ class Hub:
                 pass
         return len(humans), len(devboxes)
 
+    async def disconnect_user_sessions(
+        self, user_id: str, session_ids: set[str], code: int = 4001
+    ) -> int:
+        """Close only one user's browser sockets attached to selected sessions."""
+        async with self._lock:
+            humans = [c for c in self.humans
+                      if c.user_id == user_id
+                      and not set(c.sessions).isdisjoint(session_ids)]
+            for conn in humans:
+                self.remove_human(conn)
+        for conn in humans:
+            try:
+                await conn.ws.close(code=code)
+            except Exception:
+                pass
+        return len(humans)
+
     async def to_devbox(self, agent_id: str, frame: dict) -> bool:
         conn = self.devbox_for_agent(agent_id)
         if not conn:

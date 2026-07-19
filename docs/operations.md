@@ -31,7 +31,22 @@ Key events:
 Security audit records are also one-line JSON (`server/app/audit.py`). They carry an
 event name, outcome, actor/resource metadata and optional request context; nested
 password/token/secret/cookie/authorization/API-key values are recursively redacted,
-and audit emission never interrupts the request path.
+and audit emission never interrupts the request path. Cut 8 emits `workspace.created`,
+`workspace.member_added`, `workspace.role_changed`, `workspace.member_removed`,
+`keyboard.acquired`, `keyboard.requested`, `keyboard.released` and `keyboard.handed_off`;
+actor/resource IDs are metadata only and no terminal payload is added to audit records.
+
+## Workspace collaboration operations
+
+Keyboard ownership is a 30-second database lease. Active holders renew on input and the browser
+sends a 20-second heartbeat; the server releases the lease when that user's final socket for the
+Session closes. An abandoned lease is therefore automatically reclaimable after TTL without an
+operator database edit. A holder can hand off an outstanding request in the terminal header.
+
+The current deployment remains intentionally single-instance: live participant fan-out uses the
+in-process Hub and lease decisions use the one App Service SQLite database. Do not scale out above
+one instance until Cut 9 supplies shared routing and a shared lease backend. Workspace membership
+and lease rows are included in normal SQLite backup/restore.
 
 ## Security baseline configuration
 

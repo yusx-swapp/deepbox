@@ -1,8 +1,18 @@
 // deepbox minimal SPA
 const app = document.getElementById('app');
+// Inject the collaboration stylesheet without touching index.html.
+if(!document.querySelector('link[data-deepbox-styles]')){
+  const link = document.createElement('link');
+  link.rel = 'stylesheet'; link.href = '/static/styles.css';
+  link.setAttribute('data-deepbox-styles','');
+  document.head.appendChild(link);
+}
 let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession = null;
 let replayMode = false;
 let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
+let deriveCollaborationState, canSendInput;
+let collabState = null;  // normalized collaboration view model for curSession
+let keyboardRequester = null;
 
 async function loadReplayHelpers(){
   if(!window.DeepboxReplay){
@@ -15,6 +25,19 @@ async function loadReplayHelpers(){
     });
   }
   ({nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock} = window.DeepboxReplay);
+}
+
+async function loadCollaborationHelpers(){
+  if(!window.DeepboxCollaboration){
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/static/collaboration.js';
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('failed to load collaboration helpers'));
+      document.head.appendChild(script);
+    });
+  }
+  ({deriveCollaborationState, canSendInput} = window.DeepboxCollaboration);
 }
 const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
 const queryParams = new URLSearchParams(location.search);
@@ -274,7 +297,8 @@ function setupTerm(){
   term.open(document.getElementById('term'));
   fit.fit();
   window.onresize = ()=>{ try{fit.fit(); sendResize();}catch(e){} };
-  term.onData(d => { if(!replayMode && termWS && termWS.readyState===1 && curSession)
+  term.onData(d => { if(!replayMode && termWS && termWS.readyState===1 && curSession
+    && canSendInput && canSendInput(collabState))
     termWS.send(JSON.stringify({type:'input',session_id:curSession,data:d})); });
 }
 
@@ -292,6 +316,11 @@ function sendResize(){
 }
 
 async function openAgent(agentId, name){
+  await loadCollaborationHelpers();
+  // Switching sessions: reset collaboration state so a stale lease/holder from
+  // the previous terminal never leaks input rights into the new one.
+  collabState = null;
+  keyboardRequester = null;
   const wasReplayOrHistory = replayMode || !!document.getElementById('replaybar') ||
     !!document.querySelector('#term [data-replay]');
   stopReplay();
@@ -304,7 +333,9 @@ async function openAgent(agentId, name){
   document.getElementById('termhead').innerHTML =
     `<b>${name}</b> <span class="muted">— live terminal</span>
      <span style="flex:1"></span>
+     <span id="collab" class="collab"></span>
      <span id="stat" class="muted"></span>`;
+  renderCollab();
   term.reset();
   // Resume the newest PTY that is still alive on the devbox. Previously every
   // click silently created a new session, making persisted history invisible.
@@ -355,6 +386,17 @@ function connectTermWS(){
         term.write(`\r\n[session ended, code ${f.code}]\r\n`); break;
       case 'error':
         term.write(`\r\n[error] ${f.message}\r\n`); break;
+      case 'collaboration':
+        collabState = deriveCollaborationState(f, me ? {id: me.id, username: me.username} : null);
+        if(!collabState.isHolder) keyboardRequester = null;
+        renderCollab();
+        break;
+      case 'keyboard_request':
+        if(collabState && collabState.isHolder){
+          keyboardRequester = {id:f.requester_user_id, username:f.requester_username};
+          renderCollab();
+        }
+        break;
     }
   };
   termWS.onclose = ()=>{
@@ -365,7 +407,56 @@ function connectTermWS(){
   };
 }
 
-// ---------------- session history + replay ----------------
+// ---------------- collaboration (keyboard lease) ----------------
+function requestKeyboard(){
+  if(termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'keyboard_acquire',session_id:curSession}));
+}
+function releaseKeyboard(){
+  if(termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'keyboard_release',session_id:curSession}));
+}
+function handoffKeyboard(){
+  if(termWS && termWS.readyState===1 && curSession && keyboardRequester)
+    termWS.send(JSON.stringify({type:'keyboard_handoff',session_id:curSession,
+      target_user_id:keyboardRequester.id}));
+  keyboardRequester = null;
+}
+setInterval(()=>{
+  if(collabState && collabState.isHolder && termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'keyboard_renew',session_id:curSession}));
+}, 20000);
+// Render the compact keyboard status + action into #collab (lives in termhead).
+function renderCollab(){
+  const el = document.getElementById('collab');
+  if(!el) return;
+  const s = collabState;
+  if(!s){ el.innerHTML = ''; return; }
+  let label, cls, btn = '';
+  if(s.isViewer){
+    label = 'read-only'; cls = 'collab-viewer';
+  } else if(s.isHolder){
+    label = keyboardRequester
+      ? `${escapeHtml(keyboardRequester.username)} requests the keyboard`
+      : 'you have the keyboard';
+    cls = 'collab-holder';
+    btn = keyboardRequester
+      ? '<button class="ghost" id="collab-handoff">Hand off</button>'
+      : '<button class="ghost" id="collab-release">Release</button>';
+  } else if(s.heldByOther){
+    label = `${escapeHtml(s.holderUsername || 'someone')} is typing`; cls = 'collab-busy';
+    if(s.canRequest) btn = '<button class="ghost" id="collab-request">Request</button>';
+  } else {
+    label = 'keyboard free'; cls = 'collab-free';
+    if(s.canRequest) btn = '<button class="ghost" id="collab-request">Take keyboard</button>';
+  }
+  el.className = 'collab ' + cls;
+  el.innerHTML = `<span class="collab-dot"></span><span class="collab-label">${label}</span>${btn}`;
+  const rq = document.getElementById('collab-request'); if(rq) rq.onclick = requestKeyboard;
+  const rl = document.getElementById('collab-release'); if(rl) rl.onclick = releaseKeyboard;
+  const ho = document.getElementById('collab-handoff'); if(ho) ho.onclick = handoffKeyboard;
+}
+
 // Pure helpers (testable, no DOM/side-effects).
 
 // Format seconds as m:ss.
