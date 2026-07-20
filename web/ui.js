@@ -48,40 +48,26 @@
 
   // ---- terminal input ----------------------------------------------------
 
-  // Coalesce xterm's per-keystroke onData events before crossing the WAN. The
-  // idle timer keeps taps responsive; the max timer bounds latency while a user
-  // is typing continuously. Timers are injectable so the transport policy is
-  // testable without a browser.
-  function createTerminalInputBatcher(send, options){
-    const opts = options || {};
-    const idleMs = opts.idleMs == null ? 24 : opts.idleMs;
-    const maxMs = opts.maxMs == null ? 80 : opts.maxMs;
-    const schedule = opts.setTimeout || setTimeout;
-    const cancelTimer = opts.clearTimeout || clearTimeout;
-    let buffer = '', idleTimer = null, maxTimer = null;
+  // Forward xterm input synchronously. A terminal is latency-sensitive: adding
+  // even a short idle batching timer makes key echo feel sticky because the user
+  // already pays the browser -> server -> connector -> PTY round trip. The
+  // lifecycle guard prevents a sender captured by an old WebSocket from leaking
+  // keystrokes after a reconnect or session switch.
+  function shouldFocusTerminal(force, activeTag, terminalOwnsFocus){
+    if(force || terminalOwnsFocus) return true;
+    return !/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(String(activeTag || '').toUpperCase());
+  }
 
-    function clearTimers(){
-      if(idleTimer !== null) cancelTimer(idleTimer);
-      if(maxTimer !== null) cancelTimer(maxTimer);
-      idleTimer = null; maxTimer = null;
-    }
-    function flush(){
-      if(!buffer){ clearTimers(); return; }
-      const payload = buffer;
-      buffer = '';
-      clearTimers();
-      send(payload);
-    }
+  function createTerminalInputSender(send){
+    let active = true;
     function push(data){
       const chunk = String(data == null ? '' : data);
-      if(!chunk) return;
-      buffer += chunk;
-      if(idleTimer !== null) cancelTimer(idleTimer);
-      idleTimer = schedule(flush, idleMs);
-      if(maxTimer === null) maxTimer = schedule(flush, maxMs);
+      if(active && chunk) send(chunk);
     }
-    function discard(){ buffer = ''; clearTimers(); }
-    return {push: push, flush: flush, discard: discard};
+    // Kept for the lease transition API: there is no buffered input to drop.
+    function discard(){}
+    function close(){ active = false; }
+    return {push: push, flush: function(){}, discard: discard, close: close};
   }
 
   // ---- status helpers ----------------------------------------------------
@@ -259,7 +245,8 @@
     initials: initials,
     runtimeLabel: runtimeLabel,
     windowsConnectorCommand: windowsConnectorCommand,
-    createTerminalInputBatcher: createTerminalInputBatcher,
+    shouldFocusTerminal: shouldFocusTerminal,
+    createTerminalInputSender: createTerminalInputSender,
     devboxStatus: devboxStatus,
     agentStatus: agentStatus,
     fleetSummary: fleetSummary,

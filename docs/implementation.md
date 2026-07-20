@@ -189,9 +189,9 @@ reset 之后加载，故外部主题为唯一事实来源）。
   modal/form 取代浏览器 `prompt/alert/confirm`。**一次性 token 只渲染进内存中的
   modal DOM，绝不写 storage/cookie/URL/日志。** modal 提供 Copy token 和 Copy command；完整 Windows
   命令由 `web/ui.js::windowsConnectorCommand()` 纯函数生成，剪贴板 API 不可用时回退到临时 textarea。
-- **终端**：`setupTerm()` 建 xterm 实例（主题对齐 UI token）+ FitAddon。
+- **终端**：`setupTerm()` 建 xterm 实例（主题对齐 UI token）+ FitAddon。这里渲染的是远端真实 CLI 的原始 PTY 字节流，不是 mock Claude UI，也不在浏览器复制任何 runtime TUI。
   点某个 agent → 优先 resume 仍存活的 live PTY，否则 `POST .../sessions` 建会话 →
-  连 `/ws/term`：`term.onData` 发 `input` 帧；收 `output`/`restore` 帧 `term.write()`；
+  连 `/ws/term`：`term.onData` **同步直发**每个 `input` 事件，不设置 idle/max batching timer；收 `output`/`restore` 帧 `term.write()`。选中 agent、点击 terminal 或重新获得 keyboard lease 时主动恢复 xterm focus，`scrollOnUserInput` 保持光标可见；失去 lease 时禁用 xterm stdin，重获后立即恢复。WebSocket/session 被替换时关闭旧 input sender，防止旧连接泄漏按键。
   `window.onresize` → `fit.fit()` + `resize` 帧；断线指数退避重连。
 - 所有服务端字符串（name/handle/runtime/capabilities…）经 `esc()` HTML 转义；
   capability blob 视为 opaque，不按固定结构解析。

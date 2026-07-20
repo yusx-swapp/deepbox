@@ -19,7 +19,7 @@ let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
 let deriveCollaborationState, canSendInput;
 let collabState = null;  // normalized collaboration view model for curSession
 let keyboardRequester = null;
-let termInputBatcher = null;
+let termInputSender = null;
 let ui = null;           // DeepboxUI pure helpers (dynamically loaded)
 
 // Cached dynamic-module loaders (same pattern as replay/collaboration).
@@ -477,18 +477,35 @@ function termHost(){
   return host;
 }
 
+function focusTerminal(force){
+  if(!term || replayMode) return;
+  const active = document.activeElement;
+  const terminalOwnsFocus = !!(active && active.classList
+    && active.classList.contains('xterm-helper-textarea'));
+  const mayFocus = ui && ui.shouldFocusTerminal
+    ? ui.shouldFocusTerminal(force, active && active.tagName, terminalOwnsFocus)
+    : force || terminalOwnsFocus;
+  if(!mayFocus) return;
+  requestAnimationFrame(()=>{
+    if(!term || replayMode) return;
+    term.focus();
+    term.scrollToBottom();
+  });
+}
+
 function setupTerm(){
   const host = termHost();
   if(!host) return;
   term = new Terminal({fontFamily:"'JetBrains Mono',Consolas,monospace",fontSize:13,
-    cursorBlink:true, scrollback:5000, theme:XTERM_THEME});
+    cursorBlink:true, scrollOnUserInput:true, scrollback:5000, theme:XTERM_THEME});
   fit = new FitAddon.FitAddon(); term.loadAddon(fit);
   term.open(host);
+  host.addEventListener('pointerdown', ()=>focusTerminal(true));
   fit.fit();
   window.onresize = ()=>{ try{fit.fit(); sendResize();}catch(e){} };
-  term.onData(d => { if(!replayMode && termInputBatcher && curSession
+  term.onData(d => { if(!replayMode && termInputSender && curSession
     && canSendInput && canSendInput(collabState))
-    termInputBatcher.push(d); });
+    termInputSender.push(d); });
 }
 
 function resetTerminal(){
@@ -519,7 +536,7 @@ async function openAgent(agentId, name){
   if(replaybar) replaybar.remove();
   if(wasReplayOrHistory || !term || !document.getElementById('term')) resetTerminal();
   // leaving previous session? flush input, then detach it (do NOT kill its PTY)
-  if(termInputBatcher) termInputBatcher.flush();
+  if(termInputSender) termInputSender.flush();
   if(termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'detach',session_id:curSession}));
   document.getElementById('termhead').innerHTML =
@@ -530,6 +547,7 @@ async function openAgent(agentId, name){
      <span id="stat" class="status"></span>`;
   renderCollab();
   term.reset();
+  focusTerminal(true);
   // Resume the newest PTY that is still alive on the devbox. Previously every
   // click silently created a new session, making persisted history invisible.
   const sessions = await api(`/api/agents/${agentId}/sessions`);
@@ -550,13 +568,13 @@ function setStat(txt, state){
 }
 
 function connectTermWS(){
-  if(termInputBatcher){ termInputBatcher.discard(); termInputBatcher = null; }
+  if(termInputSender){ termInputSender.close(); termInputSender = null; }
   if(termWS){ try{ wantOpen && (termWS.onclose=null); termWS.close(); }catch(e){} }
   const proto = location.protocol==='https:'?'wss':'ws';
   termWS = new WebSocket(`${proto}://${location.host}/ws/term`);
   const inputWS = termWS;
   const inputSession = curSession;
-  termInputBatcher = ui.createTerminalInputBatcher(data => {
+  termInputSender = ui.createTerminalInputSender(data => {
     if(inputWS.readyState===1 && inputSession===curSession)
       inputWS.send(JSON.stringify({type:'input',session_id:inputSession,data:data}));
   });
@@ -587,14 +605,17 @@ function connectTermWS(){
         term.write(`\r\n[session ended, code ${f.code}]\r\n`); break;
       case 'error':
         term.write(`\r\n[error] ${f.message}\r\n`); break;
-      case 'collaboration':
+      case 'collaboration': {
+        const hadKeyboard = !!(collabState && collabState.isHolder);
         collabState = deriveCollaborationState(f, me ? {id: me.id, username: me.username} : null);
         if(!collabState.isHolder){
           keyboardRequester = null;
-          if(termInputBatcher) termInputBatcher.discard();
+          if(termInputSender) termInputSender.discard();
         }
         renderCollab();
+        if(!hadKeyboard && collabState.isHolder) focusTerminal(true);
         break;
+      }
       case 'keyboard_request':
         if(collabState && collabState.isHolder){
           keyboardRequester = {id:f.requester_user_id, username:f.requester_username};
@@ -604,7 +625,7 @@ function connectTermWS(){
     }
   };
   termWS.onclose = ()=>{
-    if(termInputBatcher){ termInputBatcher.discard(); termInputBatcher = null; }
+    if(termInputSender){ termInputSender.close(); termInputSender = null; }
     if(!wantOpen) return;
     setStat('reconnecting\u2026','busy');
     reconnectTimer = setTimeout(connectTermWS, reconnectDelay);
@@ -618,7 +639,7 @@ function requestKeyboard(){
     termWS.send(JSON.stringify({type:'keyboard_acquire',session_id:curSession}));
 }
 function releaseKeyboard(){
-  if(termInputBatcher) termInputBatcher.flush();
+  if(termInputSender) termInputSender.flush();
   if(termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'keyboard_release',session_id:curSession}));
 }
@@ -637,6 +658,7 @@ function renderCollab(){
   const el = document.getElementById('collab');
   if(!el) return;
   const s = collabState;
+  if(term) term.options.disableStdin = !(s && s.isHolder);
   if(!s){ el.innerHTML = ''; return; }
   let label, cls, btn = '';
   if(s.isViewer){
