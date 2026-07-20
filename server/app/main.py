@@ -1126,6 +1126,13 @@ async def ws_devbox(ws: WebSocket):
                     result = recording_store.persist_output(s, devbox_id=d.id,
                                                              frame=frame)
                     if result.outcome == NEW:
+                        # The ACK boundary is the durable commit above. Browser
+                        # fan-out is best-effort and must never hold the connector
+                        # spool hostage to a stale resumed terminal socket.
+                        await ws.send_json({
+                            "type": "ack", "session_id": sid,
+                            "pty_instance_id": frame.get("pty_instance_id"),
+                            "seq": frame.get("seq")})
                         # Feed the live screen exactly once (no .cast dual-write)
                         # and broadcast to any attached viewers.
                         ls = live_registry.get_or_create(sid)
@@ -1142,10 +1149,6 @@ async def ws_devbox(ws: WebSocket):
                                 rows=getattr(ls, "rows", 24))
                         except Exception:
                             logger.debug("checkpoint failed", exc_info=True)
-                        await ws.send_json({
-                            "type": "ack", "session_id": sid,
-                            "pty_instance_id": frame.get("pty_instance_id"),
-                            "seq": frame.get("seq")})
                     elif result.outcome == DUPLICATE:
                         # Already durable and identical: re-ACK, do NOT re-feed
                         # or re-broadcast.

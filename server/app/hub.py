@@ -28,13 +28,19 @@ class HumanConn:
 
 
 class Hub:
-    def __init__(self) -> None:
+    def __init__(
+        self, human_send_timeout: float = 1.0, human_queue_size: int = 128
+    ) -> None:
         self.devboxes: dict[str, DevboxConn] = {}      # devbox_id -> conn
         self.agent_to_devbox: dict[str, str] = {}      # agent_id -> devbox_id
         self.humans: set[HumanConn] = set()
         # session_id -> set of HumanConn watching it
         self.session_watchers: dict[str, set[HumanConn]] = {}
         self._lock = asyncio.Lock()
+        self._human_send_timeout = human_send_timeout
+        self._human_queue_size = human_queue_size
+        self._human_queues: dict[HumanConn, asyncio.Queue[dict]] = {}
+        self._human_sender_tasks: dict[HumanConn, asyncio.Task] = {}
 
     # ---- devbox side ----
     async def add_devbox(self, conn: DevboxConn):
@@ -69,10 +75,49 @@ class Hub:
         self.humans.discard(conn)
         for sid in list(conn.sessions):
             self.session_watchers.get(sid, set()).discard(conn)
+        self._human_queues.pop(conn, None)
+        task = self._human_sender_tasks.pop(conn, None)
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if task is not None and task is not current_task:
+            task.cancel()
+
+    def _ensure_human_sender(self, conn: HumanConn) -> asyncio.Queue[dict]:
+        queue = self._human_queues.get(conn)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self._human_queue_size)
+            self._human_queues[conn] = queue
+            self._human_sender_tasks[conn] = asyncio.create_task(
+                self._send_to_human(conn, queue)
+            )
+        return queue
+
+    async def _send_to_human(
+        self, conn: HumanConn, queue: asyncio.Queue[dict]
+    ) -> None:
+        try:
+            while True:
+                frame = await queue.get()
+                await asyncio.wait_for(
+                    conn.ws.send_json(frame), timeout=self._human_send_timeout
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.remove_human(conn)
+            try:
+                await asyncio.wait_for(
+                    conn.ws.close(code=1011), timeout=self._human_send_timeout
+                )
+            except Exception:
+                pass
 
     def watch(self, conn: HumanConn, session_id: str, agent_id: str):
         conn.sessions[session_id] = agent_id
         self.session_watchers.setdefault(session_id, set()).add(conn)
+        self._ensure_human_sender(conn)
 
     def unwatch(self, conn: HumanConn, session_id: str):
         conn.sessions.pop(session_id, None)
@@ -139,11 +184,22 @@ class Hub:
         return True
 
     async def to_session_humans(self, session_id: str, frame: dict):
+        """Enqueue ordered fan-out without waiting on browser network I/O."""
         for conn in list(self.session_watchers.get(session_id, set())):
+            queue = self._ensure_human_sender(conn)
             try:
-                await conn.ws.send_json(frame)
-            except Exception:
-                pass
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                self.remove_human(conn)
+                asyncio.create_task(self._close_stale_human(conn))
+
+    async def _close_stale_human(self, conn: HumanConn) -> None:
+        try:
+            await asyncio.wait_for(
+                conn.ws.close(code=1011), timeout=self._human_send_timeout
+            )
+        except Exception:
+            pass
 
 
 hub = Hub()

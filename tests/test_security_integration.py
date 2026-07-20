@@ -1,9 +1,11 @@
 """Route-level regression tests for the private-alpha security baseline."""
+import asyncio
 import hashlib
 import importlib
 import os
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -171,3 +173,48 @@ def test_rotation_revokes_every_prior_token_and_exposes_no_hash():
     listing = client.get(f"/api/devboxes/{devbox_id}/tokens").text
     assert old_plaintext not in listing
     assert all(row.hash not in listing for row in rows)
+
+
+def test_durable_output_ack_precedes_stalled_browser_fanout():
+    main, client = build_app()
+    bootstrap(client)
+    created = client.post("/api/devboxes", json={"name": "box"}).json()
+    devbox_id = created["devbox"]["id"]
+    token = created["token"]
+    agent = client.post(f"/api/devboxes/{devbox_id}/agents", json={
+        "handle": "shell", "display_name": "Shell", "runtime": "mock",
+    }).json()
+    session_id = "ack-before-fanout"
+    with main.models.SessionLocal() as session:
+        user = session.query(main.User).filter_by(username="owner").one()
+        session.add(main.Session(
+            id=session_id, user_id=user.id, agent_id=agent["id"], title="ack",
+        ))
+        session.commit()
+
+    original_fanout = main.hub.to_session_humans
+
+    async def stalled_fanout(_session_id, _frame):
+        await asyncio.sleep(0.25)
+
+    main.hub.to_session_humans = stalled_fanout
+    try:
+        with client.websocket_connect(
+            "/ws/devbox", headers={"authorization": f"Bearer {token}"},
+        ) as ws:
+            assert ws.receive_json()["type"] == "hello"
+            started = time.monotonic()
+            ws.send_json({
+                "type": "output", "session_id": session_id,
+                "pty_instance_id": "pty-1", "seq": 1,
+                "kind": "o", "data": "hello", "elapsed": 0.01,
+            })
+            ack = ws.receive_json()
+            elapsed = time.monotonic() - started
+        assert ack == {
+            "type": "ack", "session_id": session_id,
+            "pty_instance_id": "pty-1", "seq": 1,
+        }
+        assert elapsed < 0.15
+    finally:
+        main.hub.to_session_humans = original_fanout
