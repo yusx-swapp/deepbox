@@ -82,6 +82,16 @@ def test_security_headers_and_auth_no_store_are_applied():
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_shell_and_static_assets_are_always_revalidated():
+    _main, client = build_app()
+    shell = client.get("/")
+    helper = client.get("/static/ui.js")
+    assert shell.status_code == 200
+    assert helper.status_code == 200
+    assert shell.headers["cache-control"] == "no-cache"
+    assert helper.headers["cache-control"] == "no-cache"
+
+
 def test_production_cookie_mutation_requires_allowed_origin():
     _main, client = build_app(production=True)
     bootstrap(client)

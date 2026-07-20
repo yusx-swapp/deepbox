@@ -193,6 +193,7 @@ reset 之后加载，故外部主题为唯一事实来源）。
   点某个 agent → 优先 resume 仍存活的 live PTY，否则 `POST .../sessions` 建会话 →
   连 `/ws/term`：`term.onData` **同步直发**每个 `input` 事件，不设置 idle/max batching timer；收 `output`/`restore` 帧 `term.write()`。选中 agent、点击 terminal 或重新获得 keyboard lease 时主动恢复 xterm focus，`scrollOnUserInput` 保持光标可见；失去 lease 时禁用 xterm stdin，重获后立即恢复。WebSocket/session 被替换时关闭旧 input sender，防止旧连接泄漏按键。
   `window.onresize` → `fit.fit()` + `resize` 帧；断线指数退避重连。
+- **静态资源兼容性**：shell 与 `/static/*` 响应使用 `Cache-Control: no-cache`，每次页面加载都向 server 重新验证。`ui.js` 的 URL 带 terminal-input capability revision，且 loader 只有检测到 `createTerminalInputSender` 才接受已有的 `DeepboxUI`；因此新 `app.js` 不会再与浏览器缓存中的旧 batcher helper 混用并在连接终端时抛错。
 - 所有服务端字符串（name/handle/runtime/capabilities…）经 `esc()` HTML 转义；
   capability blob 视为 opaque，不按固定结构解析。
 

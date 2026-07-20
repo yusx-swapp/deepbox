@@ -25,12 +25,17 @@ let ui = null;           // DeepboxUI pure helpers (dynamically loaded)
 // Cached dynamic-module loaders (same pattern as replay/collaboration).
 let replayHelpersPromise = null, collaborationHelpersPromise = null, uiPromise = null;
 
-function loadScriptOnce(src, globalName, errMsg){
+function loadScriptOnce(src, globalName, errMsg, isUsable){
   return new Promise((resolve, reject) => {
-    if(window[globalName]) return resolve(window[globalName]);
+    const current = window[globalName];
+    if(current && (!isUsable || isUsable(current))) return resolve(current);
     const script = document.createElement('script');
     script.src = src;
-    script.onload = () => resolve(window[globalName]);
+    script.onload = () => {
+      const loaded = window[globalName];
+      if(loaded && (!isUsable || isUsable(loaded))) resolve(loaded);
+      else reject(new Error(errMsg));
+    };
     script.onerror = () => reject(new Error(errMsg));
     document.head.appendChild(script);
   });
@@ -53,8 +58,12 @@ async function loadCollaborationHelpers(){
 }
 
 async function loadUI(){
-  uiPromise = uiPromise ||
-    loadScriptOnce('/static/ui.js', 'DeepboxUI', 'failed to load ui helpers');
+  uiPromise = uiPromise || loadScriptOnce(
+    '/static/ui.js?cap=immediate-terminal-input-v1',
+    'DeepboxUI',
+    'failed to load compatible ui helpers',
+    mod => typeof mod.createTerminalInputSender === 'function'
+  );
   ui = await uiPromise;
   return ui;
 }

@@ -135,6 +135,11 @@ async def security_baseline(request: Request, call_next):
     response.headers.update(build_security_headers(production=settings.production))
     if path.startswith("/api/auth/") or "/tokens" in path:
         response.headers["Cache-Control"] = "no-store"
+    elif path == "/" or path.startswith("/static/"):
+        # The shell and its dynamically loaded helpers must be one compatible cut.
+        # Revalidate on every page load so an App Service deployment cannot mix a
+        # fresh app.js with an older cached helper API.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 models.init_db(settings.database_url)
