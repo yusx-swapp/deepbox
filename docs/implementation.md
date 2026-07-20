@@ -307,6 +307,8 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
   last-seen；server 广播 `collaboration` frame（participants + keyboard state），浏览器显示只读/可请求/持有状态。
 - `KeyboardLease` 以 `session_id` 为主键，60 秒 TTL，handoff 通过 `version` 做 compare-and-swap。Operator/Admin/Owner 可
   `keyboard_acquire/renew/release`；忙时请求广播给 holder，holder 以 `keyboard_handoff {target_user_id}` 原子移交。
+  lease 到期比较先把 SQLite round-trip 后的 naive UTC 与 timezone-aware 时间统一归一化，避免 terminal WebSocket
+  因 `can't compare offset-naive and offset-aware datetimes` 异常断开并持续 reconnect。
   只有有效 holder 可发送 `input`/`resize`/`terminate`；每次输入自动续租，浏览器持有期间每 20 秒续租，
   holder 断开最后一个该用户连接时释放。Viewer 的控制 frame 返回 `read_only`。
 - `web/collaboration.js` 是可独立测试的权限/租约 UI 状态 helper；`styles.css` 由 `app.js` 动态加载，

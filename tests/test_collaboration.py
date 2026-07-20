@@ -93,6 +93,22 @@ class KeyboardLeaseTests(unittest.TestCase):
         self.db = _mkdb()
         self.t0 = dt.datetime(2024, 1, 1, 12, 0, 0)
 
+    def test_expiration_compares_sqlite_naive_to_aware_utc(self):
+        lease = KeyboardLease(
+            session_id="s-aware", holder_user_id="u1",
+            expires_at=self.t0, version=1)
+        aware_now = self.t0.replace(tzinfo=dt.timezone.utc)
+        self.assertTrue(collab.lease_is_expired(lease, aware_now))
+
+    def test_expiration_normalizes_aware_offsets(self):
+        offset = dt.timezone(dt.timedelta(hours=8))
+        lease = KeyboardLease(
+            session_id="s-offset", holder_user_id="u1",
+            expires_at=(self.t0 + dt.timedelta(hours=8)).replace(tzinfo=offset),
+            version=1)
+        self.assertTrue(collab.lease_is_expired(
+            lease, self.t0.replace(tzinfo=dt.timezone.utc)))
+
     def test_viewer_cannot_acquire(self):
         with self.assertRaises(collab.PermissionDenied):
             collab.acquire_keyboard_lease(

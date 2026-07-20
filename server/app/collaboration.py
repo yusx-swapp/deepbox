@@ -48,6 +48,13 @@ def _now(now: dt.datetime | None) -> dt.datetime:
     return now if now is not None else dt.datetime.utcnow()
 
 
+def _utc_naive(value: dt.datetime) -> dt.datetime:
+    """Normalize SQLite-naive and timezone-aware timestamps for comparison."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
 # --- role ordering ---------------------------------------------------------
 
 def role_rank(role: str) -> int:
@@ -124,8 +131,15 @@ def get_keyboard_lease(db: DbSession, session_id: str) -> KeyboardLease | None:
     )
 
 
+def lease_is_expired(
+    lease: KeyboardLease, at: dt.datetime | None = None
+) -> bool:
+    """Return expiration state across SQLite's naive datetime round-trips."""
+    return _utc_naive(lease.expires_at) <= _utc_naive(_now(at))
+
+
 def _is_expired(lease: KeyboardLease, now: dt.datetime) -> bool:
-    return lease.expires_at <= now
+    return lease_is_expired(lease, now)
 
 
 def acquire_keyboard_lease(

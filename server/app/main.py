@@ -39,8 +39,9 @@ from .capacity import collect_capacity, transition_event
 from .audit import audit_event
 from .collaboration import (
     LeaseConflict, LeaseError, PermissionDenied, acquire_keyboard_lease, can_control,
-    get_keyboard_lease, get_role, handoff_keyboard_lease, list_user_workspaces,
-    release_keyboard_lease, renew_keyboard_lease, require_workspace_access, role_at_least,
+    get_keyboard_lease, get_role, handoff_keyboard_lease, lease_is_expired,
+    list_user_workspaces, release_keyboard_lease, renew_keyboard_lease,
+    require_workspace_access, role_at_least,
 )
 from .security import (
     SAFE_METHODS, RateLimiter, RateLimitRule, build_security_headers,
@@ -701,7 +702,7 @@ def _session_role(s: OrmSession, user_id: str, sess: Session,
 
 def _lease_json(s: OrmSession, sess: Session, user_id: str, role: str) -> dict:
     lease = get_keyboard_lease(s, sess.id)
-    active = bool(lease and lease.expires_at > now())
+    active = bool(lease and not lease_is_expired(lease, now()))
     holder = s.get(User, lease.holder_user_id) if active else None
     return {"type": "collaboration", "session_id": sess.id, "role": role,
             "keyboard": {"holder_user_id": lease.holder_user_id if active else None,
@@ -1288,7 +1289,7 @@ async def ws_term(ws: WebSocket):
                     s.add(SessionParticipant(id=new_id(), session_id=sess.id,
                                              user_id=uid, role=role))
                 lease = get_keyboard_lease(s, sess.id)
-                if can_control(role) and (not lease or lease.expires_at <= now()):
+                if can_control(role) and (not lease or lease_is_expired(lease, now())):
                     acquire_keyboard_lease(s, sess.id, uid, role)
                     audit_event("keyboard.acquired", actor_user_id=uid,
                                 resource_type="session", resource_id=sess.id,
@@ -1389,7 +1390,7 @@ async def ws_term(ws: WebSocket):
                                             "message": "viewer access is read-only"})
                         continue
                     lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
                         await ws.send_json({"type": "error", "code": "keyboard_lease_required",
                                             "message": "request keyboard control before typing"})
                         if sess:
@@ -1419,7 +1420,7 @@ async def ws_term(ws: WebSocket):
                 agent_id = conn.sessions.get(sid)
                 if agent_id:
                     lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
                         continue
                     ls = live_registry.get(sid)
                     if ls:
@@ -1443,7 +1444,7 @@ async def ws_term(ws: WebSocket):
                         await ws.send_json({"type": "error", "message": "terminate not allowed"})
                         continue
                     lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease.expires_at <= now():
+                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
                         await ws.send_json({"type": "error", "code": "keyboard_lease_required",
                                             "message": "keyboard holder controls termination"})
                         continue
