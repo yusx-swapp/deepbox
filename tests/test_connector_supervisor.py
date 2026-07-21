@@ -165,21 +165,108 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         sup.attach(sup_end)
         drain = asyncio.create_task(sup.drain_to(sup_end))
         try:
-            first = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
-            self.assertEqual(first["frame"]["pty_instance_id"], "old")
+            # Cut 9: with bounded pipelining all three frames drain without
+            # waiting for ACKs; the forked tail and the fresh output are both
+            # sent (the server, not the connector, decides the fork).
+            delivered = []
+            for _ in range(3):
+                env = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+                delivered.append(env["frame"]["pty_instance_id"])
+            self.assertEqual(delivered, ["old", "old", "new"])
 
-            # Server fences the forked instance instead of erroring.
+            # Server fences the forked instance instead of erroring. The fence
+            # purges the poison rows from the spool and drops their in-flight
+            # window entries so their ACKs are no longer required.
             await sup.handle_control({
                 "type": "fence", "session_id": "s", "pty_instance_id": "old",
             })
 
-            # After the fence the poison tail is gone and the newer instance's
-            # output becomes the next frame delivered.
-            nxt = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
-            self.assertEqual(nxt["frame"]["pty_instance_id"], "new")
-            self.assertEqual(nxt["frame"]["data"], "fresh")
             pending = sup._spool.records()
             self.assertTrue(all(r.pty_instance_id != "old" for r in pending))
+            # The fresh instance's row survives the fence and stays deliverable.
+            self.assertTrue(any(r.pty_instance_id == "new" for r in pending))
+            # No stale in-flight ids remain for the fenced stream.
+            self.assertEqual(sup._inflight_bytes,
+                             sum(sup._inflight_ids.values()))
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+    async def test_pipelines_multiple_frames_before_any_ack(self):
+        # Core Cut 9 property at the supervisor layer: with a bounded window,
+        # many durable frames drain before the first ACK returns.
+        sup = SessionSupervisor()
+        for i in range(5):
+            sup.emit({"type": "output", "session_id": "s",
+                      "pty_instance_id": "p", "data": f"chunk-{i}"})
+        sup_end, tx_end = LoopbackChannel.pair()
+        sup.attach(sup_end)
+        drain = asyncio.create_task(sup.drain_to(sup_end))
+        try:
+            got = []
+            for _ in range(5):
+                env = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+                got.append(env["frame"]["data"])
+            # All five sent with zero ACKs consumed yet.
+            self.assertEqual(got, [f"chunk-{i}" for i in range(5)])
+            self.assertEqual(len(sup._inflight_ids), 5)
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+    async def test_window_bounds_inflight_frames(self):
+        # The in-flight window is bounded by frame count; the sender stops
+        # after MAX_INFLIGHT_FRAMES until ACKs free capacity.
+        from connector.supervisor import MAX_INFLIGHT_FRAMES
+        sup = SessionSupervisor()
+        total = MAX_INFLIGHT_FRAMES + 5
+        for i in range(total):
+            sup.emit({"type": "output", "session_id": "s",
+                      "pty_instance_id": "p", "data": f"c{i}"})
+        sup_end, tx_end = LoopbackChannel.pair()
+        sup.attach(sup_end)
+        drain = asyncio.create_task(sup.drain_to(sup_end))
+        try:
+            for _ in range(MAX_INFLIGHT_FRAMES):
+                await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+            # Window full: no further frame until an ACK frees a slot.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(tx_end.recv(), timeout=0.05)
+            self.assertEqual(len(sup._inflight_ids), MAX_INFLIGHT_FRAMES)
+            # ACK the oldest row; exactly one more frame drains.
+            oldest = min(d for d in sup._inflight_ids
+                         if not isinstance(d, str))
+            await sup.handle_control({"type": "ipc_delivery_ack",
+                                      "delivery_id": oldest})
+            env = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+            self.assertEqual(env["frame"]["type"], "output")
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+    async def test_out_of_order_ack_only_releases_its_own_row(self):
+        # A non-contiguous ACK must not delete a different spool row; the spool
+        # keeps strict per-stream contiguity.
+        sup = SessionSupervisor()
+        for i in range(3):
+            sup.emit({"type": "output", "session_id": "s",
+                      "pty_instance_id": "p", "data": f"d{i}"})
+        sup_end, tx_end = LoopbackChannel.pair()
+        sup.attach(sup_end)
+        drain = asyncio.create_task(sup.drain_to(sup_end))
+        try:
+            envs = [await asyncio.wait_for(tx_end.recv(), 1.0) for _ in range(3)]
+            ids = [e["delivery_id"] for e in envs]
+            before = len(sup._spool.pending_records())
+            # ACK the middle row first: spool must not drop anything yet
+            # (seq is not last_acked+1), and the id stays in-flight.
+            await sup.handle_control({"type": "ipc_delivery_ack",
+                                      "delivery_id": ids[1]})
+            self.assertEqual(len(sup._spool.pending_records()), before)
+            # ACK the head row: now the first (and only the first) row leaves.
+            await sup.handle_control({"type": "ipc_delivery_ack",
+                                      "delivery_id": ids[0]})
+            self.assertEqual(len(sup._spool.pending_records()), before - 1)
         finally:
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)

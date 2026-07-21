@@ -29,6 +29,13 @@ from .ipc import Channel
 from .pty_session import PtySession, resolve_cmd
 from .spool import InMemorySpool, SpoolBase
 
+# Cut 9 pipelining bounds: how many durable output frames (and their bytes) may
+# be in flight to the transport before earlier ACKs return. The disk spool is
+# still the durability source of truth; this only bounds send-ahead so a slow or
+# disconnected server cannot create unbounded WebSocket / memory pressure.
+MAX_INFLIGHT_FRAMES = 64
+MAX_INFLIGHT_BYTES = 512 * 1024
+
 
 class _PendingView:
     """List-like compatibility view over ephemeral controls + durable output."""
@@ -79,8 +86,15 @@ class SessionSupervisor:
         # A frame remains queued until the transport confirms WebSocket send.
         # The IPC delivery_id carried to the transport IS the durable seq, so an
         # ACK maps exactly back to the persisted record.
-        self._inflight_delivery_id: int | str | None = None
-        self._delivery_ack = asyncio.Event()
+        # Cut 9: bounded pipelining. Multiple durable frames may be in flight
+        # to the transport at once instead of one-frame-per-RTT stop-and-wait.
+        # ``_inflight_ids`` maps every delivery_id currently handed to the
+        # transport but not yet acknowledged (control:N ids and spool ``ord``
+        # ints) to its payload byte size. A frame is never re-sent while its id
+        # is in this map; on attach the map is cleared so a fresh transport
+        # replays the whole backlog in order.
+        self._inflight_ids: dict[int | str, int] = {}
+        self._inflight_bytes = 0
         # The currently attached transport channel, or None when detached.
         self._channel: Channel | None = None
         # Un-acked frames recovered from a prior run are immediately eligible.
@@ -96,6 +110,10 @@ class SessionSupervisor:
         drain loop resends them in order.
         """
         self._channel = channel
+        # A fresh transport has no memory of what the previous one sent. Clear
+        # the in-flight window so drain_to replays every un-acked frame in order.
+        self._inflight_ids.clear()
+        self._inflight_bytes = 0
         if self.pending:
             self.pending_event.set()
 
@@ -125,34 +143,89 @@ class SessionSupervisor:
         self.pending_event.set()
 
     async def drain_to(self, channel: Channel) -> None:
-        """Forward buffered frames to ``channel`` until cancelled.
+        """Forward buffered frames to ``channel`` with bounded pipelining.
 
-        Durable outputs carry their spool row ``ord`` as ``delivery_id``;
-        ephemeral controls carry a process-local ``control:N`` ID. The supervisor
-        advances only after the transport acknowledges the exact in-flight ID.
-        If transport disappears first, output stays durable for the next attach.
+        Cut 9: instead of one-frame-per-RTT stop-and-wait, up to
+        ``MAX_INFLIGHT_FRAMES`` / ``MAX_INFLIGHT_BYTES`` durable frames may be in
+        flight to the transport before their ACKs return. Durable outputs carry
+        their spool row ``ord`` as ``delivery_id``; ephemeral controls carry a
+        process-local ``control:N`` ID. A frame is never re-sent while its id is
+        already in ``_inflight_ids``; the spool stays the durability source of
+        truth, so any un-acked frame replays in order on the next attach.
         """
         while True:
-            records = self._spool.pending_records()
-            if self._controls:
-                delivery_id, frame = self._controls[0]
-            elif records:
-                delivery_id, frame = records[0]
-            else:
-                self.pending_event.clear()
-                if self._controls or self._spool.pending_records():
+            sent_any = False
+            # Controls take priority (lifecycle / input_ack) and are cheap.
+            for delivery_id, frame in list(self._controls):
+                if delivery_id in self._inflight_ids:
                     continue
-                await self.pending_event.wait()
+                if len(self._inflight_ids) >= MAX_INFLIGHT_FRAMES:
+                    break
+                self._inflight_ids[delivery_id] = 0
+                await channel.send({
+                    "type": "ipc_delivery",
+                    "delivery_id": delivery_id,
+                    "frame": frame,
+                })
+                sent_any = True
+            # Durable outputs, strictly in global ``ord`` order.
+            for delivery_id, frame in self._spool.pending_records():
+                if delivery_id in self._inflight_ids:
+                    continue
+                size = len(str(frame.get("data", "")))
+                if self._inflight_ids and (
+                    len(self._inflight_ids) >= MAX_INFLIGHT_FRAMES
+                    or self._inflight_bytes + size > MAX_INFLIGHT_BYTES
+                ):
+                    # Window full: stop scanning; an ACK will free room and
+                    # re-set pending_event so we resume from the same tail.
+                    break
+                self._inflight_ids[delivery_id] = size
+                self._inflight_bytes += size
+                await channel.send({
+                    "type": "ipc_delivery",
+                    "delivery_id": delivery_id,
+                    "frame": frame,
+                })
+                sent_any = True
+            if sent_any:
+                # More rows may now fit (or new frames arrived); re-scan.
                 continue
-            self._inflight_delivery_id = delivery_id
-            self._delivery_ack.clear()
-            await channel.send({
-                "type": "ipc_delivery",
-                "delivery_id": delivery_id,
-                "frame": frame,
-            })
-            await self._delivery_ack.wait()
-            self._inflight_delivery_id = None
+            self.pending_event.clear()
+            if self._has_sendable():
+                continue
+            await self.pending_event.wait()
+
+    def _has_sendable(self) -> bool:
+        """True if any pending frame is not yet in the in-flight window."""
+        if len(self._inflight_ids) >= MAX_INFLIGHT_FRAMES:
+            return False
+        for delivery_id, _ in self._controls:
+            if delivery_id not in self._inflight_ids:
+                return True
+        for delivery_id, _ in self._spool.pending_records():
+            if delivery_id not in self._inflight_ids:
+                return True
+        return False
+
+    def _release_inflight(self, delivery_id) -> None:
+        """Drop one delivery_id from the window and re-arm the sender."""
+        size = self._inflight_ids.pop(delivery_id, None)
+        if size:
+            self._inflight_bytes -= size
+        self.pending_event.set()
+
+    def _reconcile_inflight_after_fence(self) -> None:
+        """Drop in-flight durable ids whose spool rows a fence just purged."""
+        valid = {ordv for ordv, _ in self._spool.pending_records()}
+        for delivery_id in list(self._inflight_ids):
+            if isinstance(delivery_id, str) and delivery_id.startswith("control:"):
+                continue
+            if delivery_id not in valid:
+                size = self._inflight_ids.pop(delivery_id, 0)
+                if size:
+                    self._inflight_bytes -= size
+
 
     # -- control handling --------------------------------------------------
 
@@ -171,10 +244,9 @@ class SessionSupervisor:
             pid_f = frame.get("pty_instance_id")
             if sid_f and pid_f:
                 self._spool.fence(sid_f, pid_f)
-                # The fence only arrives while this instance's output is the
-                # inflight row, so releasing the delivery gate is safe.
-                self._inflight_delivery_id = None
-                self._delivery_ack.set()
+                # Drop any in-flight durable ids the fence just purged so the
+                # window frees up and newer output can drain.
+                self._reconcile_inflight_after_fence()
                 self.pending_event.set()
             return
         aid = frame.get("agent_id")
@@ -213,22 +285,28 @@ class SessionSupervisor:
             self.emit(self.sessions_frame())
 
     def _apply_ack(self, delivery_id) -> None:
-        """Advance only the exact in-flight control or oldest durable output."""
-        if delivery_id is None or delivery_id != self._inflight_delivery_id:
+        """Advance the exact acknowledged control or durable output row.
+
+        With bounded pipelining several ids are in flight at once, so the ACK
+        need not match a single gate; it must match an id we actually sent
+        (present in ``_inflight_ids``). Spool advancement stays strict and
+        per-stream contiguous — ``spool.ack`` only removes the row when its seq
+        is the smallest AND ``last_acked + 1`` — so a stale or out-of-order ACK
+        can never delete the wrong row.
+        """
+        if delivery_id is None or delivery_id not in self._inflight_ids:
             return
         if isinstance(delivery_id, str) and delivery_id.startswith("control:"):
+            # Controls ACK in order; only release when it is the head control.
             if not self._controls or self._controls[0][0] != delivery_id:
                 return
             self._controls.popleft()
-            self._delivery_ack.set()
+            self._release_inflight(delivery_id)
             return
-        # Controls may arrive while a durable output is already in flight. They
-        # are next-in-line, not a reason to reject the exact output ACK.
-        oldest = self._spool.oldest_seq()
-        if oldest is None or delivery_id != oldest:
-            return
+        # Durable output: let the spool enforce contiguity. It returns False if
+        # this ord is not the next deletable row, leaving the spool untouched.
         if self._spool.ack(delivery_id):
-            self._delivery_ack.set()
+            self._release_inflight(delivery_id)
 
     def sessions_frame(self) -> dict:
         return {

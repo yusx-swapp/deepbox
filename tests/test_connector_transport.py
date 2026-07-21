@@ -1,4 +1,4 @@
-"""Protocol v3 transport durability acknowledgement tests."""
+
 import asyncio
 import json
 import unittest
@@ -16,6 +16,16 @@ OUTPUT = {
 }
 
 
+def _output(seq, data="ok", session_id="s1", pty="p1"):
+    return {
+        "type": "output",
+        "session_id": session_id,
+        "pty_instance_id": pty,
+        "seq": seq,
+        "data": data,
+    }
+
+
 class FakeWebSocket:
     def __init__(self, error=None):
         self.error = error
@@ -28,40 +38,73 @@ class FakeWebSocket:
 
 
 class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def _start_delivery(self, frame=None, delivery_id=7):
+    async def _start(self, ws=None):
+        """Start both the sender and the server-event processor tasks."""
         supervisor_end, transport_end = LoopbackChannel.pair()
         transport = TransportSession(transport_end)
-        ws = FakeWebSocket()
-        task = asyncio.create_task(transport._channel_to_ws(ws))
-        await supervisor_end.send({
+        ws = ws or FakeWebSocket()
+        sender = asyncio.create_task(transport._channel_to_ws(ws))
+        events = asyncio.create_task(transport._process_server_events(ws))
+        return supervisor_end, transport, ws, (sender, events)
+
+    async def _deliver(self, supervisor, frame, delivery_id=7):
+        await supervisor.send({
             "type": "ipc_delivery",
             "delivery_id": delivery_id,
-            "frame": dict(frame or OUTPUT),
+            "frame": dict(frame),
         })
         await asyncio.sleep(0)
-        return supervisor_end, transport, ws, task
+
+    async def _stop(self, tasks):
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_send_without_server_ack_does_not_release_delivery(self):
-        supervisor, _, ws, task = await self._start_delivery()
+        supervisor, _, ws, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
         self.assertEqual(ws.sent, [OUTPUT])
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(supervisor.recv(), timeout=0.02)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._stop(tasks)
 
     async def test_exact_server_ack_releases_delivery(self):
-        supervisor, transport, _, task = await self._start_delivery()
+        supervisor, transport, _, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
         await transport._server_events.put({
             "type": "ack", "session_id": "s1",
             "pty_instance_id": "p1", "seq": 1,
         })
         ack = await asyncio.wait_for(supervisor.recv(), timeout=0.2)
         self.assertEqual(ack, {"type": "ipc_delivery_ack", "delivery_id": 7})
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._stop(tasks)
+
+    async def test_pipelines_many_frames_before_first_ack(self):
+        # Core Cut 9 property: several output frames leave the transport before
+        # any ACK returns, instead of one-frame-per-RTT stop-and-wait.
+        supervisor, transport, ws, tasks = await self._start()
+        for seq in range(1, 6):
+            await self._deliver(supervisor, _output(seq), delivery_id=seq)
+        self.assertEqual([f["seq"] for f in ws.sent], [1, 2, 3, 4, 5])
+        # No ACK has been delivered yet, so nothing is released.
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(supervisor.recv(), timeout=0.02)
+        # ACKs may even arrive out of order; each releases exactly its row.
+        for seq in (3, 1, 2, 5, 4):
+            await transport._server_events.put({
+                "type": "ack", "session_id": "s1",
+                "pty_instance_id": "p1", "seq": seq,
+            })
+        released = set()
+        for _ in range(5):
+            ack = await asyncio.wait_for(supervisor.recv(), timeout=0.2)
+            released.add(ack["delivery_id"])
+        self.assertEqual(released, {1, 2, 3, 4, 5})
+        await self._stop(tasks)
 
     async def test_stale_ack_is_ignored_until_exact_ack(self):
-        supervisor, transport, _, task = await self._start_delivery()
+        supervisor, transport, _, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
         await transport._server_events.put({
             "type": "ack", "session_id": "s1",
             "pty_instance_id": "old", "seq": 1,
@@ -73,11 +116,11 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "pty_instance_id": "p1", "seq": 1,
         })
         self.assertEqual((await asyncio.wait_for(supervisor.recv(), 0.2))["delivery_id"], 7)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._stop(tasks)
 
     async def test_matching_resend_retries_same_row_before_ack(self):
-        supervisor, transport, ws, task = await self._start_delivery()
+        supervisor, transport, ws, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
         await transport._server_events.put({
             "type": "resend", "session_id": "s1",
             "pty_instance_id": "p1", "expected_seq": 1,
@@ -89,57 +132,70 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "pty_instance_id": "p1", "seq": 1,
         })
         await asyncio.wait_for(supervisor.recv(), 0.2)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._stop(tasks)
 
-    async def test_fence_for_same_stream_purges_tail_and_releases(self):
-        supervisor, transport, _, task = await self._start_delivery()
-        await transport._server_events.put({
-            "type": "fence", "session_id": "s1",
-            "pty_instance_id": "p1", "seq": 1,
-        })
-        # The transport instructs the supervisor to purge the forked tail and
-        # releases the delivery loop WITHOUT raising a ProtocolError (which would
-        # wedge the single-inflight sender into a poison-frame reconnect loop).
-        msg = await asyncio.wait_for(supervisor.recv(), timeout=0.2)
-        self.assertEqual(msg, {
-            "type": "fence", "session_id": "s1", "pty_instance_id": "p1",
-        })
-        # The delivery loop was released (no ProtocolError) and is now idle
-        # waiting for the next envelope rather than dead.
-        await asyncio.sleep(0)
-        self.assertFalse(task.done())
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    async def test_fence_for_other_stream_does_not_release(self):
-        supervisor, transport, _, task = await self._start_delivery()
-        await transport._server_events.put({
-            "type": "fence", "session_id": "s1",
-            "pty_instance_id": "other", "seq": 1,
-        })
-        # A fence targeting a different pty_instance cannot release this row.
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(supervisor.recv(), timeout=0.02)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    async def test_resume_mismatch_fails_closed_without_local_ack(self):
-        supervisor, transport, _, task = await self._start_delivery()
+    async def test_resend_retransmits_whole_tail_in_order(self):
+        # A resend for an earlier seq must replay that row and every later
+        # outstanding row on the stream, in seq order.
+        supervisor, transport, ws, tasks = await self._start()
+        for seq in (1, 2, 3):
+            await self._deliver(supervisor, _output(seq), delivery_id=seq)
+        self.assertEqual([f["seq"] for f in ws.sent], [1, 2, 3])
         await transport._server_events.put({
             "type": "resend", "session_id": "s1",
             "pty_instance_id": "p1", "expected_seq": 2,
         })
-        result = await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        self.assertEqual([f["seq"] for f in ws.sent], [1, 2, 3, 2, 3])
+        await self._stop(tasks)
+
+    async def test_fence_for_same_stream_purges_tail_and_releases(self):
+        supervisor, transport, _, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
+        await transport._server_events.put({
+            "type": "fence", "session_id": "s1",
+            "pty_instance_id": "p1", "seq": 1,
+        })
+        msg = await asyncio.wait_for(supervisor.recv(), timeout=0.2)
+        self.assertEqual(msg, {
+            "type": "fence", "session_id": "s1", "pty_instance_id": "p1",
+        })
+        # The processor released the tail without raising, so both tasks live.
+        await asyncio.sleep(0)
+        self.assertFalse(any(t.done() for t in tasks))
+        await self._stop(tasks)
+
+    async def test_fence_for_other_stream_does_not_release(self):
+        supervisor, transport, _, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
+        await transport._server_events.put({
+            "type": "fence", "session_id": "s1",
+            "pty_instance_id": "other", "seq": 1,
+        })
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(supervisor.recv(), timeout=0.02)
+        await self._stop(tasks)
+
+    async def test_resume_mismatch_fails_closed_without_local_ack(self):
+        supervisor, transport, _, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
+        await transport._server_events.put({
+            "type": "resend", "session_id": "s1",
+            "pty_instance_id": "p1", "expected_seq": 2,
+        })
+        # The server-event processor raises ProtocolError; the sender keeps
+        # running but no local ACK is emitted.
+        result = await asyncio.gather(tasks[1], return_exceptions=True)
         self.assertIsInstance(result[0], ProtocolError)
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(supervisor.recv(), timeout=0.02)
+        await self._stop((tasks[0],))
 
     async def test_reconnect_resends_unreleased_output(self):
-        supervisor, _, first_ws, first_task = await self._start_delivery()
-        first_task.cancel()
-        await asyncio.gather(first_task, return_exceptions=True)
-        # A fresh transport receives the same still-pending delivery from sessiond.
+        supervisor, _, first_ws, tasks = await self._start()
+        await self._deliver(supervisor, OUTPUT)
+        await self._stop(tasks)
+        # A fresh transport receives the same still-pending delivery.
         supervisor2, transport_end2 = LoopbackChannel.pair()
         transport2 = TransportSession(transport_end2)
         second_ws = FakeWebSocket()
@@ -149,16 +205,15 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(first_ws.sent, [OUTPUT])
         self.assertEqual(second_ws.sent, [OUTPUT])
-        second_task.cancel()
-        await asyncio.gather(second_task, return_exceptions=True)
+        await self._stop((second_task,))
 
     async def test_control_frame_keeps_send_boundary_ack(self):
         frame = {"type": "ready", "session_id": "s1"}
-        supervisor, _, ws, task = await self._start_delivery(frame=frame)
+        supervisor, _, ws, tasks = await self._start()
+        await self._deliver(supervisor, frame)
         self.assertEqual(ws.sent, [frame])
         self.assertEqual((await asyncio.wait_for(supervisor.recv(), 0.2))["delivery_id"], 7)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._stop(tasks)
 
     async def test_failed_websocket_send_is_not_acknowledged(self):
         supervisor_end, transport_end = LoopbackChannel.pair()
