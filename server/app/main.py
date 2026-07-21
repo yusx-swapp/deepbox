@@ -1133,7 +1133,12 @@ async def ws_devbox(ws: WebSocket):
                         # include the fsync. Feeding the live screen and
                         # broadcasting are pure in-memory / socket work.
                         ls = live_registry.get_or_create(sid)
-                        ls.feed_live_output(frame.get("data", ""))
+                        if frame.get("kind") != "event":
+                            # Structured (chat) frames carry a JSON canonical
+                            # event in `data`, not terminal bytes; never feed
+                            # them into the pyte screen. The browser demuxes on
+                            # `kind` and renders a chat surface instead.
+                            ls.feed_live_output(frame.get("data", ""))
                         await hub.to_session_humans(sid, frame)
                         # Now make it durable OFF the event loop: a synchronous
                         # SQLite commit (network disk) would otherwise stall the

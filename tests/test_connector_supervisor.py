@@ -51,7 +51,7 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         FakePty.instances = []
         self._orig = supervisor_mod.PtySession
         supervisor_mod.PtySession = FakePty
-        supervisor_mod.resolve_cmd = lambda runtime, launch: ["fake"]
+        supervisor_mod.resolve_cmd = lambda runtime, launch, **kw: ["fake"]
 
     def tearDown(self):
         supervisor_mod.PtySession = self._orig
@@ -382,7 +382,7 @@ class TwoProcessSplitTests(unittest.IsolatedAsyncioTestCase):
         self._orig = supervisor_mod.PtySession
         supervisor_mod.PtySession = FakePty
         self._orig_resolve = supervisor_mod.resolve_cmd
-        supervisor_mod.resolve_cmd = lambda runtime, launch: ["fake"]
+        supervisor_mod.resolve_cmd = lambda runtime, launch, **kw: ["fake"]
         self._tmp = tempfile.mkdtemp(prefix="deepbox-split-test-")
         uniq = str(os.getpid()) + str(id(self))
         self._suffix = "splittest" + uniq

@@ -356,3 +356,48 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
   Funnel 或直接暴露 Uvicorn 到公网。
 
 后续顺序见 `planning.md`。
+
+
+## 9. Cut 10：结构化 Agent 编排（chat surface）
+
+### 动机
+全屏 TUI 投屏（xterm + PTY 原始字节）把每次重绘、每个按键回显都逼上网络往返，
+体验退化且难以横向接入异构 agent。Cut 10 转向"编排 agent"而非"投屏终端"：以
+headless/structured 模式驱动 agent，翻译其原生协议为一套 **agent 无关的规范事件流**，
+浏览器直接渲染真正的 chat UI（消息气泡、工具卡片、权限弹窗）。
+
+### 规范事件（canonical events）
+连接器把每个 agent 的原生流翻译为下列事件（`connector/agent_session.py`）：
+`status`、`message.delta`（助手文本增量）、`message`、`tool.call`、`tool.result`、
+`permission.ask`、`turn.end`、`user.echo`、`error`。每个事件是一个 JSON 对象，
+放在 `kind="event"` 的普通 output 帧的 `data` 字段里。
+
+### 复用既有传输
+关键设计：**规范事件就是 `kind="event"` 的有序输出帧**。服务器对 `kind` 不分支——
+`classify_output()` / `commit_new()` 照常持久化，`hub.to_session_humans()` 照常扇出，
+durable spool / ACK / replay / fence 语义完全复用。唯一特化：服务器在 fan-out 前
+不把 event 帧喂进 pyte 屏（`main.py::ws_devbox` 的 `feed_live_output` 前置判断），
+因为它们是 JSON 而非终端字节；浏览器按 `kind` demux。
+
+### 连接器：StructuredAgentSession
+`connector/agent_session.py` 提供与 `PtySession` **接口一致**的类
+（`start/write/resize/kill/is_alive` + `on_output/on_exit`），supervisor 仅按 runtime 的
+`structured` 标志选择构造哪个类（`open_pty`）。Claude Code 以
+`claude -p --output-format stream-json --input-format stream-json
+--include-partial-messages --verbose [--permission-mode ...]` 运行，逐行 JSON 于 stdio。
+翻译核心 `translate_claude_event()` 是纯函数，便于离线单测（合成 stream-json，不烧 token，
+见 `tests/test_agent_session.py`）。用户整段消息经 `write()` 编码为一条 user turn；
+权限应答经 `respond_permission()` 走 control_response。
+
+### runtime 注册
+`connector/runtimes.py` 新增 `structured: bool` 字段与 `claude-code-structured` runtime。
+默认 permission mode 为 `acceptEdits`（"信任此会话/自动接受编辑"），可请求更严格模式。
+接入新 agent（Copilot CLI、Codex）只需再写一个 translator + register()。
+
+### 前端：chat surface
+`web/chat.js` 提供纯 reducer `applyEvent(state, ev)`（可 node --test 离线验证，
+见 `web/chat.test.js`）+ DOM 渲染 `renderChat()`。`web/app.js` 在 `onmessage` 里对
+`kind==='event'` 的帧走 `handleChatFrame`（首个 event 帧惰性切入 chat 模式，
+不再喂 xterm）；输入框整段发送（0-RTT 本地回显后发一条 `type:'input'` 帧）；
+权限弹窗经 `type:'permission'` 帧应答。切换 agent 时重置为终端模式，xterm 路径作为回退，
+两条 UI 并存、按 agent 能力选择。

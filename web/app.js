@@ -57,6 +57,18 @@ async function loadCollaborationHelpers(){
   return mod;
 }
 
+let chatHelpersPromise = null;
+let Chat = null;               // DeepboxChat module once loaded
+let chatState = null;          // current structured session view model
+let structuredMode = false;    // is the open session a structured (chat) agent?
+async function loadChatHelpers(){
+  chatHelpersPromise = chatHelpersPromise ||
+    loadScriptOnce('/static/chat.js', 'DeepboxChat', 'failed to load chat helpers');
+  Chat = await chatHelpersPromise;
+  return Chat;
+}
+
+
 async function loadUI(){
   uiPromise = uiPromise || loadScriptOnce(
     '/static/ui.js?cap=immediate-terminal-input-v1',
@@ -529,6 +541,77 @@ function sendResize(){
     {type:'resize',session_id:curSession,cols:term.cols,rows:term.rows}));
 }
 
+// --- Structured chat surface (Cut 10) -------------------------------------
+async function enterChatMode(){
+  if(structuredMode && document.getElementById('chat-surface')) return;
+  await loadChatHelpers();
+  structuredMode = true;
+  chatState = Chat.initialChatState();
+  const body = document.getElementById('stagebody');
+  if(!body) return;
+  body.innerHTML =
+    `<div id="chat-surface" class="chat-surface">
+       <div id="chat-scroll" class="chat-scroll"></div>
+       <form id="chat-form" class="chat-form">
+         <textarea id="chat-input" class="chat-input" rows="2"
+           placeholder="Message the agent\u2026  (Enter to send, Shift+Enter for newline)"></textarea>
+         <button type="submit" class="chat-send">Send</button>
+       </form>
+     </div>`;
+  const form = document.getElementById('chat-form');
+  const input = document.getElementById('chat-input');
+  form.onsubmit = (e)=>{ e.preventDefault(); sendChatMessage(); };
+  input.addEventListener('keydown', (e)=>{
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChatMessage(); }
+  });
+  input.focus();
+  renderChatSurface();
+}
+
+function renderChatSurface(){
+  const scroll = document.getElementById('chat-scroll');
+  if(scroll && Chat && chatState)
+    Chat.renderChat(scroll, chatState, {onPermission: sendPermission});
+}
+
+function sendChatMessage(){
+  const input = document.getElementById('chat-input');
+  if(!input) return;
+  const text = input.value;
+  if(!text.trim()) return;
+  if(!(canSendInput && canSendInput(collabState))) return;
+  // 0-RTT local echo, then send the whole turn as one input frame. The
+  // connector's structured session encodes it as a user message for the agent.
+  Chat.appendUserTurn(chatState, text);
+  renderChatSurface();
+  if(termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'input',session_id:curSession,data:text}));
+  input.value = '';
+  input.focus();
+}
+
+function sendPermission(requestId, allow){
+  if(chatState) chatState.pendingPermission = null;
+  renderChatSurface();
+  if(termWS && termWS.readyState===1 && curSession)
+    termWS.send(JSON.stringify({type:'permission',session_id:curSession,
+      request_id:requestId, allow:!!allow}));
+}
+
+function handleChatFrame(f){
+  // Lazily switch into chat mode on the first structured event, then fold it.
+  const apply = ()=>{
+    if(!chatState) return;
+    let ev;
+    try{ ev = JSON.parse(f.data); }catch(_){ return; }
+    Chat.applyEvent(chatState, ev);
+    renderChatSurface();
+  };
+  if(structuredMode && chatState){ apply(); }
+  else { enterChatMode().then(apply); }
+}
+
+
 async function openAgent(agentId, name){
   await loadCollaborationHelpers();
   // Switching sessions: reset collaboration state so a stale lease/holder from
@@ -536,6 +619,10 @@ async function openAgent(agentId, name){
   collabState = null;
   keyboardRequester = null;
   curAgentId = agentId;
+  // Leaving any previous structured chat surface: fall back to terminal until
+  // the new session proves structured (first kind:'event' frame).
+  structuredMode = false;
+  chatState = null;
   renderFleet();
   const wasReplayOrHistory = replayMode || !!document.getElementById('replaybar') ||
     !!document.querySelector('#term [data-replay]') ||
@@ -596,6 +683,13 @@ function connectTermWS(){
   termWS.onmessage = (ev)=>{
     const f = JSON.parse(ev.data);
     if(f.session_id && f.session_id!==curSession) return;
+    // Structured (chat) frames carry a canonical event JSON in `data`. Render
+    // them into the chat surface instead of the terminal. Everything else
+    // (status/exit/collaboration/keyboard) still flows through the switch.
+    if(f.kind==='event' && (f.type==='output' || f.type==='restore')){
+      handleChatFrame(f);
+      return;
+    }
     switch(f.type){
       case 'restore':          // reconnect: instantly repaint current screen
         term.reset(); term.write(f.data); break;

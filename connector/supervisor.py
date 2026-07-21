@@ -27,6 +27,8 @@ from uuid import UUID, uuid4
 
 from .ipc import Channel
 from .pty_session import PtySession, resolve_cmd
+from .agent_session import StructuredAgentSession
+from . import runtimes
 from .spool import InMemorySpool, SpoolBase
 
 # Cut 9 pipelining bounds: how many durable output frames (and their bytes) may
@@ -275,6 +277,13 @@ class SessionSupervisor:
             p = self.ptys.get((aid, sid))
             if p:
                 p.resize(frame.get("cols", 80), frame.get("rows", 24))
+        elif t == "permission":
+            # Answer a pending permission.ask for a structured agent. Idempotent
+            # and best-effort: only structured sessions expose this method.
+            p = self.ptys.get((aid, sid))
+            if p is not None and hasattr(p, "respond_permission"):
+                p.respond_permission(str(frame.get("request_id", "")),
+                                     bool(frame.get("allow")))
         elif t in ("close", "terminate"):
             key = (aid, sid)
             p = self.ptys.pop(key, None)
@@ -334,13 +343,22 @@ class SessionSupervisor:
             self.pty_instances.pop(key, None)
         pty_instance_id = str(uuid4())
         info = self.agents.get(agent_id, {})
-        cmd = resolve_cmd(info.get("runtime", "mock"), info.get("launch_cmd"))
+        runtime_id = info.get("runtime", "mock")
+        cmd = resolve_cmd(runtime_id, info.get("launch_cmd"),
+                          model=info.get("model"),
+                          permission_mode=info.get("permission_mode"))
+        structured = runtimes.has(runtime_id) and runtimes.get(runtime_id).structured
 
         async def on_output(data: str):
-            self.emit({"type": "output", "agent_id": agent_id,
-                       "session_id": session_id,
-                       "pty_instance_id": pty_instance_id,
-                       "data": data})
+            frame = {"type": "output", "agent_id": agent_id,
+                     "session_id": session_id,
+                     "pty_instance_id": pty_instance_id,
+                     "data": data}
+            if structured:
+                # Canonical event stream (not terminal bytes). The server
+                # persists/fans this out unchanged; the browser renders chat.
+                frame["kind"] = "event"
+            self.emit(frame)
 
         async def on_exit(code: int):
             # A stale reader may finish after open_pty has replaced its dead PTY.
@@ -354,10 +372,15 @@ class SessionSupervisor:
                        "code": code})
             self.pty_instances.pop(key, None)
 
-        p = PtySession(cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows)
+        if structured:
+            p = StructuredAgentSession(
+                cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows)
+        else:
+            p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
+                           cols=cols, rows=rows)
         try:
             await p.start()
-        except Exception as e:  # pragma: no cover - real PTY spawn failure
+        except Exception as e:  # pragma: no cover - real spawn failure
             self.emit({"type": "exit", "agent_id": agent_id,
                        "session_id": session_id, "code": -1,
                        "data": f"\r\n[failed to start: {e}]\r\n"})
@@ -366,7 +389,8 @@ class SessionSupervisor:
         self.pty_instances[key] = pty_instance_id
         self.emit({"type": "ready", "agent_id": agent_id,
                    "session_id": session_id,
-                   "pty_instance_id": pty_instance_id})
+                   "pty_instance_id": pty_instance_id,
+                   "structured": structured})
         self.emit({"type": "presence", "agent_id": agent_id, "state": "online"})
 
     def status(self) -> dict:

@@ -153,6 +153,11 @@ class RuntimeAdapter:
     permission_modes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     environment: dict[str, str] = field(default_factory=dict)
     probe_hint: Callable[[], bool] | None = None
+    # When True this runtime is driven headless via a structured JSON protocol
+    # (connector.agent_session.StructuredAgentSession) instead of a PTY. The
+    # web UI renders a chat surface (bubbles/tool cards/permission prompts)
+    # rather than a terminal for such agents.
+    structured: bool = False
 
     @property
     def executable(self) -> str:
@@ -169,6 +174,7 @@ class RuntimeAdapter:
             "features": {
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
+                "structured": self.structured,
             },
         }
 
@@ -324,3 +330,40 @@ register(RuntimeAdapter(
         "full-auto": ("--ask-for-approval", "never", "--sandbox", "workspace-write"),
     },
 ))
+
+# ---------------------------------------------------------------------------
+# Structured (headless) runtimes (Cut 10): driven via a JSON protocol on stdio
+# instead of a PTY, so the web UI renders a chat surface with 0-RTT local
+# input and streaming events. Adding one is still a single register() call.
+#
+# Claude Code headless:
+#   claude -p --output-format stream-json --input-format stream-json
+#          --include-partial-messages --verbose [--permission-mode ...]
+# The default permission mode ("") accepts edits for this session per the
+# product decision "信任此会话/自动接受编辑"; callers can still request a
+# stricter mode. --verbose is required by Claude when output-format is
+# stream-json in -p mode.
+# ---------------------------------------------------------------------------
+register(RuntimeAdapter(
+    id="claude-code-structured",
+    label="Claude Code (chat)",
+    base_argv=(
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--input-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+    ),
+    model_flag="--model",
+    models=("sonnet", "opus", "haiku"),
+    structured=True,
+    permission_modes={
+        # Default trusts this session (auto-accept edits) per product decision.
+        "": ("--permission-mode", "acceptEdits"),
+        "acceptEdits": ("--permission-mode", "acceptEdits"),
+        "default": ("--permission-mode", "default"),
+        "plan": ("--permission-mode", "plan"),
+        "bypassPermissions": ("--dangerously-skip-permissions",),
+    },
+))
+
