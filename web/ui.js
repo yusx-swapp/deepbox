@@ -34,15 +34,29 @@
 
   // Generate the exact Windows connector bootstrap command shown after a
   // devbox token is minted. Keeping this pure makes wrapping/copy regressions
-  // testable without a browser.
+  // testable without a browser. Emits a single self-contained PowerShell block:
+  // export the two env vars, then pipe the hosted one-line installer. The
+  // installer sets up ~/.deepbox (venv + deps) on first run and reuses it after,
+  // so the user never clones the repo or installs dependencies by hand.
+  const INSTALL_PS1_URL = 'https://deeporca.blob.core.windows.net/deepbox/install.ps1';
+  const INSTALL_SH_URL = 'https://deeporca.blob.core.windows.net/deepbox/install.sh';
   function windowsConnectorCommand(serverUrl, token){
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
     return [
-      'set "DEEPBOX_SERVER_URL=' + server + '"',
-      'set "DEEPBOX_TOKEN=' + secret + '"',
-      'python -m connector --doctor',
-      'python -m connector',
+      '$env:DEEPBOX_SERVER_URL = "' + server + '"',
+      '$env:DEEPBOX_TOKEN = "' + secret + '"',
+      'irm ' + INSTALL_PS1_URL + ' | iex',
+    ].join('\n');
+  }
+  // macOS / Linux equivalent (POSIX shell). Same hosted-installer approach.
+  function unixConnectorCommand(serverUrl, token){
+    const server = String(serverUrl == null ? '' : serverUrl).trim();
+    const secret = String(token == null ? '' : token).trim();
+    return [
+      'export DEEPBOX_SERVER_URL="' + server + '"',
+      'export DEEPBOX_TOKEN="' + secret + '"',
+      'curl -fsSL ' + INSTALL_SH_URL + ' | bash',
     ].join('\n');
   }
 
@@ -245,6 +259,7 @@
     initials: initials,
     runtimeLabel: runtimeLabel,
     windowsConnectorCommand: windowsConnectorCommand,
+    unixConnectorCommand: unixConnectorCommand,
     shouldFocusTerminal: shouldFocusTerminal,
     createTerminalInputSender: createTerminalInputSender,
     devboxStatus: devboxStatus,

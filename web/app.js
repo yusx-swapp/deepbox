@@ -443,6 +443,7 @@ async function createDevbox() {
 // never written to localStorage, cookies, the URL or the console.
 async function showToken(tok){
   const command = ui.windowsConnectorCommand(location.origin, tok);
+  const unixCommand = ui.unixConnectorCommand(location.origin, tok);
   const bindCopy = (overlay, selector, text)=>{
     const button = overlay.querySelector(selector);
     if(!button) return;
@@ -460,15 +461,18 @@ async function showToken(tok){
   };
   await showModal({
     title:'Devbox token \u2014 shown once',
-    desc:'Copy this token now. The server stores only its hash and cannot show it again.',
-    bodyHtml:`<div class="token-head"><b>Token</b><button class="ghost compact" id="copy-token">Copy token</button></div>
+    desc:'Copy this token now. The server stores only its hash and cannot show it again. Run one of the commands below on the machine you want to connect \u2014 no repo clone or manual setup needed.',
+      bodyHtml:`<div class="token-head"><b>Token</b><button class="ghost compact" id="copy-token">Copy token</button></div>
       <div class="token">${esc(tok)}</div>
-      <div class="token-head"><b>Windows connector command</b><button class="ghost compact" id="copy-command">Copy command</button></div>
-      <div class="token token-command">${esc(command)}</div>`,
+      <div class="token-head"><b>Windows \u00b7 PowerShell</b><button class="ghost compact" id="copy-command">Copy command</button></div>
+      <div class="token token-command">${esc(command)}</div>
+      <div class="token-head"><b>macOS / Linux</b><button class="ghost compact" id="copy-command-unix">Copy command</button></div>
+      <div class="token token-command">${esc(unixCommand)}</div>`,
     actions:[{label:'Done', primary:true, value:true}],
     onReady:(overlay)=>{
       bindCopy(overlay, '#copy-token', tok);
       bindCopy(overlay, '#copy-command', command);
+      bindCopy(overlay, '#copy-command-unix', unixCommand);
     }});
 }
 

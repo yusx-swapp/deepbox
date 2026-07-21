@@ -34,10 +34,18 @@ test('runtimeLabel keeps adapter-owned runtime IDs opaque', () => {
 test('windowsConnectorCommand is complete and directly copyable', () => {
   assert.equal(
     ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test'),
-    'set "DEEPBOX_SERVER_URL=https://deepbox.example"\n' +
-      'set "DEEPBOX_TOKEN=hpc_box_test"\n' +
-      'python -m connector --doctor\n' +
-      'python -m connector'
+    '$env:DEEPBOX_SERVER_URL = "https://deepbox.example"\n' +
+      '$env:DEEPBOX_TOKEN = "hpc_box_test"\n' +
+      'irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex'
+  );
+});
+
+test('unixConnectorCommand mirrors the Windows one-liner for POSIX shells', () => {
+  assert.equal(
+    ui.unixConnectorCommand('https://deepbox.example', 'hpc_box_test'),
+    'export DEEPBOX_SERVER_URL="https://deepbox.example"\n' +
+      'export DEEPBOX_TOKEN="hpc_box_test"\n' +
+      'curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash'
   );
 });
 
