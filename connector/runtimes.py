@@ -158,6 +158,12 @@ class RuntimeAdapter:
     # web UI renders a chat surface (bubbles/tool cards/permission prompts)
     # rather than a terminal for such agents.
     structured: bool = False
+    # Per-turn structured runtimes (e.g. Copilot ``-p``) spawn a fresh process
+    # for each user turn instead of holding a persistent stdin session. When
+    # True the connector uses StructuredAgentSession(per_turn=True) and appends
+    # ``prompt_argv`` + the prompt text to argv for each turn.
+    per_turn: bool = False
+    prompt_argv: tuple[str, ...] = ()
 
     @property
     def executable(self) -> str:
@@ -175,6 +181,7 @@ class RuntimeAdapter:
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
                 "structured": self.structured,
+                "per_turn": self.per_turn,
             },
         }
 
@@ -364,6 +371,32 @@ register(RuntimeAdapter(
         "default": ("--permission-mode", "default"),
         "plan": ("--permission-mode", "plan"),
         "bypassPermissions": ("--dangerously-skip-permissions",),
+    },
+))
+
+register(RuntimeAdapter(
+    id="copilot-cli-structured",
+    label="GitHub Copilot (chat)",
+    # Copilot's ``-p`` runs one prompt then exits, emitting newline-delimited
+    # JSON. Each user turn spawns a fresh process (per_turn=True); the prompt
+    # text is appended after ``prompt_argv``. Context does not currently carry
+    # across turns (stateless v1) — a future cut can share ``--session-id``.
+    base_argv=(
+        "copilot",
+        "--output-format", "json",
+        "--stream", "on",
+        "--no-color",
+    ),
+    model_flag="--model",
+    models=("gpt-5", "claude-sonnet-4.5"),
+    structured=True,
+    per_turn=True,
+    prompt_argv=("-p",),
+    permission_modes={
+        # Non-interactive turns require tool auto-approval; make it the default.
+        "": ("--allow-all-tools",),
+        "allowAll": ("--allow-all-tools",),
+        "allowAllPaths": ("--allow-all-tools", "--allow-all-paths"),
     },
 ))
 

@@ -181,6 +181,65 @@ def _flatten_tool_result(content) -> str:
     return str(content)
 
 
+def translate_copilot_event(obj: dict) -> list[dict]:
+    """Translate one GitHub Copilot CLI ``--output-format json`` object.
+
+    Pure function (no I/O), unit-tested with synthetic transcripts. Copilot
+    emits newline-delimited JSON objects shaped ``{"type","data","id",...}``.
+    Handled types:
+      * ``assistant.message_delta`` -> message.delta  (data.deltaContent)
+      * ``assistant.message``       -> message (final) + tool.call per toolRequest
+      * ``assistant.turn_end`` / ``result`` -> turn.end
+      * ``session.*`` (mcp/skills/tools loaded, status) -> status (or dropped)
+      * ``user.message``            -> [] (our own echo; UI already showed it)
+    Unknown/ephemeral shapes yield ``[]`` (forward-compatible).
+    """
+    t = obj.get("type")
+    data = obj.get("data") or {}
+
+    if t == "assistant.message_delta":
+        txt = data.get("deltaContent")
+        if txt:
+            return [_event(EV_MESSAGE_DELTA, text=txt)]
+        return []
+
+    if t == "assistant.message":
+        out: list[dict] = []
+        # The streamed deltas already carried the text; emit a final marker so
+        # the UI closes the bubble, then surface any tool requests.
+        out.append(_event(EV_MESSAGE, final=True, text=data.get("content") or ""))
+        for tr in data.get("toolRequests") or []:
+            out.append(_event(EV_TOOL_CALL,
+                              tool=tr.get("name") or tr.get("tool"),
+                              tool_id=tr.get("id"),
+                              input=tr.get("arguments") if "arguments" in tr
+                              else tr.get("input")))
+        return out
+
+    if t == "tool.execution_started" or t == "tool.call":
+        return [_event(EV_TOOL_CALL, tool=data.get("name"),
+                       tool_id=data.get("id") or data.get("toolCallId"),
+                       input=data.get("arguments") or data.get("input"))]
+
+    if t in ("tool.execution_completed", "tool.result"):
+        return [_event(EV_TOOL_RESULT,
+                       tool_id=data.get("id") or data.get("toolCallId"),
+                       is_error=bool(data.get("isError") or data.get("error")),
+                       content=_flatten_tool_result(
+                           data.get("result") if "result" in data
+                           else data.get("content")))]
+
+    if t in ("assistant.turn_end", "result"):
+        return [_event(EV_TURN_END, subtype=t,
+                       is_error=bool((data or {}).get("error")))]
+
+    if t and t.startswith("session."):
+        # Startup/system status; keep it lightweight and non-content.
+        return [_event(EV_STATUS, subtype=t)]
+
+    return []
+
+
 def encode_user_message(text: str) -> str:
     """Encode a user turn as one Claude ``stream-json`` stdin line."""
     return json.dumps({
@@ -201,6 +260,19 @@ def encode_permission_response(request_id: str, allow: bool) -> str:
     }) + "\n"
 
 
+# Translator registry: pick by runtime id so adding an agent is one function
+# plus one register() — no changes to the session machinery.
+TRANSLATORS: dict = {}
+
+
+def register_translator(runtime_id: str, fn):
+    TRANSLATORS[runtime_id] = fn
+
+
+register_translator("claude-code-structured", translate_claude_event)
+register_translator("copilot-cli-structured", translate_copilot_event)
+
+
 class StructuredAgentSession:
     """Drive one agent in headless structured mode, PtySession-compatible.
 
@@ -208,13 +280,24 @@ class StructuredAgentSession:
     ``stdin`` (with ``write``/``drain``/``close``), ``stdout`` (an async line
     iterator via ``readline``), ``wait()`` and ``kill()`` — i.e. an
     ``asyncio.subprocess.Process``. The default spawns the real agent.
+
+    Two drive modes cover the spread of headless agents:
+
+    * **persistent** (default; Claude Code): one long-lived process; ``write``
+      pushes a user turn onto its stdin via ``encode_user_message``.
+    * **per_turn** (Copilot CLI ``-p``): the agent runs one prompt then exits,
+      so each ``write(text)`` spawns a fresh process with the prompt appended
+      to argv, sharing a stable ``--session-id`` for context. Process exit
+      ends only that turn, not the server session.
     """
 
     def __init__(self, cmd: list[str], cwd: str | None,
                  on_output: Callable[[str], Awaitable[None]],
                  on_exit: Callable[[int], Awaitable[None]],
                  cols: int = 120, rows: int = 30,
-                 spawn: Callable[..., Awaitable] | None = None):
+                 spawn: Callable[..., Awaitable] | None = None,
+                 translate=None, per_turn: bool = False,
+                 prompt_argv=None):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
@@ -222,24 +305,71 @@ class StructuredAgentSession:
         self.cols = cols
         self.rows = rows
         self._spawn = spawn or self._default_spawn
+        self._translate = translate or translate_claude_event
+        self._per_turn = per_turn
+        # For per_turn: extra argv inserted before the prompt (e.g. the prompt
+        # flag). The prompt text is appended as the final argv element.
+        self._prompt_argv = list(prompt_argv or [])
         self._proc = None
         self._alive = False
         self._stderr_tail: list[str] = []
 
-    async def _default_spawn(self):
+
+    async def _default_spawn(self, prompt: str | None = None):
+        argv = list(self.cmd)
+        if self._per_turn and prompt is not None:
+            argv = argv + self._prompt_argv + [prompt]
         return await asyncio.create_subprocess_exec(
-            *self.cmd, cwd=self.cwd,
+            *argv, cwd=self.cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
     async def start(self):
+        if self._per_turn:
+            # No process until the first user turn; the session is "alive" in
+            # the sense that the server session should stay open awaiting input.
+            self._alive = True
+            self._proc = None
+            self._spawn_lock = asyncio.Lock()
+            await self._emit(_event(EV_STATUS, subtype="ready"))
+            return
         self._proc = await self._spawn()
         self._alive = True
         asyncio.create_task(self._read_stdout())
         if getattr(self._proc, "stderr", None) is not None:
             asyncio.create_task(self._read_stderr())
+
+    async def _run_one_turn(self, prompt: str):
+        """per_turn: spawn a fresh process for a single prompt and drain it."""
+        async with self._spawn_lock:
+            self._proc = await self._spawn(prompt)
+            if getattr(self._proc, "stderr", None) is not None:
+                asyncio.create_task(self._read_stderr())
+            await self._drain_turn()
+
+    async def _drain_turn(self):
+        proc = self._proc
+        stream = proc.stdout
+        while True:
+            try:
+                line = await stream.readline()
+            except (asyncio.LimitOverrunError, ValueError):
+                continue
+            except Exception:
+                break
+            if not line:
+                break
+            await self._handle_line(line)
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        # Turn finished; ensure the UI closes the turn even if the agent didn't
+        # emit an explicit terminal event.
+        await self._emit(_event(EV_TURN_END, subtype="process_exit"))
+        self._proc = None
 
     async def _read_stdout(self):
         proc = self._proc
@@ -290,14 +420,19 @@ class StructuredAgentSession:
             # rather than dropping, but never as assistant content.
             await self._emit(_event(EV_STATUS, note=text[:500]))
             return
-        for ev in translate_claude_event(obj):
+        for ev in self._translate(obj):
             await self._emit(ev)
 
     async def _emit(self, ev: dict):
         await self.on_output(json.dumps(ev))
 
     def is_alive(self) -> bool:
-        if not self._alive or self._proc is None:
+        if not self._alive:
+            return False
+        if self._per_turn:
+            # Between turns there is no process, but the session stays open.
+            return True
+        if self._proc is None:
             return False
         rc = getattr(self._proc, "returncode", None)
         if rc is not None:
@@ -307,7 +442,16 @@ class StructuredAgentSession:
 
     def write(self, data: str):
         """Send one user turn. ``data`` is plain text (not terminal bytes)."""
-        if not self.is_alive() or self._proc is None:
+        if not self.is_alive():
+            return
+        if self._per_turn:
+            # One process per prompt (Copilot -p). Ignore overlapping turns
+            # while one is still running (the lock also guards this).
+            if self._proc is not None:
+                return
+            asyncio.create_task(self._run_one_turn(data))
+            return
+        if self._proc is None:
             return
         stdin = self._proc.stdin
         if stdin is None:

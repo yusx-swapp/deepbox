@@ -373,8 +373,13 @@ class SessionSupervisor:
             self.pty_instances.pop(key, None)
 
         if structured:
+            adapter = runtimes.get(runtime_id)
+            from .agent_session import TRANSLATORS
             p = StructuredAgentSession(
-                cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows)
+                cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows,
+                translate=TRANSLATORS.get(runtime_id),
+                per_turn=getattr(adapter, "per_turn", False),
+                prompt_argv=list(getattr(adapter, "prompt_argv", ())))
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)
