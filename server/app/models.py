@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from sqlalchemy import (
     create_engine, String, Text, ForeignKey, DateTime, JSON, Integer, Float,
-    UniqueConstraint, inspect, text,
+    UniqueConstraint, inspect, text, event,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker,
@@ -296,10 +296,43 @@ SessionLocal: sessionmaker | None = None
 def init_db(url: str = "sqlite:///deepbox.db"):
     global _engine, SessionLocal
     _engine = create_engine(url, connect_args={"check_same_thread": False})
+    if url.startswith("sqlite"):
+        _tune_sqlite(_engine)
     SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     Base.metadata.create_all(_engine)
     _migrate(_engine)
     return _engine
+
+
+def _tune_sqlite(engine) -> None:
+    """Make per-frame commits cheap on Azure Files network storage.
+
+    Every durable output frame commits one RecordingFrame row before the
+    server ACKs and broadcasts it to the browser. The SQLite defaults
+    (journal_mode=DELETE, synchronous=FULL) force several fsync round-trips per
+    commit; on the app's ``/home`` Azure Files share each fsync is a network
+    round-trip, which shows up as per-keystroke echo latency because the
+    synchronous commit also stalls the event loop.
+
+    WAL + synchronous=NORMAL collapses this to a single sequential append and
+    defers the expensive sync to checkpoints, while staying crash-safe: under
+    WAL, NORMAL survives OS/process crashes with no corruption (only a power
+    loss can lose the last few committed transactions). The connector's durable
+    spool remains the source of truth and re-sends any un-ACKed frame on
+    reconnect, so even that residual risk is recoverable.
+    """
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA busy_timeout=5000")
+            cur.execute("PRAGMA wal_autocheckpoint=1000")
+        finally:
+            cur.close()
+
 
 
 def _migrate(engine) -> None:
