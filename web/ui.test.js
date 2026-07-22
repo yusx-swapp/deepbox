@@ -27,8 +27,21 @@ test('initials builds a stable monogram', () => {
 
 test('runtimeLabel keeps adapter-owned runtime IDs opaque', () => {
   assert.equal(ui.runtimeLabel('claude-code'), 'claude-code');
-  assert.equal(ui.runtimeLabel('mystery-runtime'), 'mystery-runtime');
+  assert.equal(ui.runtimeLabel('vendor/new-adapter'), 'vendor/new-adapter');
   assert.equal(ui.runtimeLabel(''), 'runtime');
+});
+
+test('runtimeOptions preserves reported adapter IDs and removes bad duplicates', () => {
+  assert.deepEqual(ui.runtimeOptions([
+    'claude-code', 'codex-cli', 'claude-code', '', '  ', null,
+    ' vendor/new-adapter '
+  ]), ['claude-code', 'codex-cli', 'vendor/new-adapter']);
+  assert.deepEqual(ui.runtimeOptions(null), []);
+});
+
+test('agentApiPath safely addresses opaque agent IDs', () => {
+  assert.equal(ui.agentApiPath('agent/with spaces'),
+    '/api/agents/agent%2Fwith%20spaces');
 });
 
 test('windowsConnectorCommand is complete and directly copyable', () => {

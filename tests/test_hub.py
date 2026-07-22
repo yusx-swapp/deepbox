@@ -140,6 +140,21 @@ class RecorderWebSocket:
         self.close_codes.append(code)
 
 
+class BlockingWebSocket(RecorderWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.send_cancelled = asyncio.Event()
+
+    async def send_json(self, frame):
+        self.send_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.send_cancelled.set()
+            raise
+
+
 class HubSyncAgentsTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_agents_updates_routes_and_pushes_directory(self):
         hub = Hub()
@@ -160,7 +175,49 @@ class HubSyncAgentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hub.is_agent_online("a2"))
         self.assertEqual(hub.agent_to_devbox["a2"], "box")
         self.assertEqual(hub.devboxes["box"].agent_ids, {"a1", "a2"})
+        for _ in range(10):
+            if ws.sent:
+                break
+            await asyncio.sleep(0)
         self.assertEqual(ws.sent, [{"type": "agents", "agents": directory}])
+        await hub.remove_devbox("box")
+
+    async def test_initial_frames_precede_directory_reconciliation(self):
+        hub = Hub()
+        ws = RecorderWebSocket()
+        conn = DevboxConn(ws=ws, devbox_id="box", agent_ids={"a1"})
+        await hub.add_devbox(conn, initial_frames=({"type": "hello"},))
+        await hub.sync_agents(
+            "box", {"a1"}, [{"id": "a1", "runtime": "mock"}])
+        for _ in range(10):
+            if len(ws.sent) == 2:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual([frame["type"] for frame in ws.sent],
+                         ["hello", "agents"])
+        await hub.remove_devbox("box")
+
+    async def test_duplicate_connection_retires_old_sender_and_routes(self):
+        hub = Hub(devbox_close_timeout=0.2)
+        old_ws = BlockingWebSocket()
+        old = DevboxConn(ws=old_ws, devbox_id="box", agent_ids={"old"})
+        await hub.add_devbox(old)
+        self.assertTrue(hub.send_devbox(old, {"type": "heartbeat_ack"}))
+        await asyncio.wait_for(old_ws.send_started.wait(), timeout=1)
+
+        new_ws = RecorderWebSocket()
+        new = DevboxConn(ws=new_ws, devbox_id="box", agent_ids={"new"})
+        await hub.add_devbox(new)
+
+        self.assertTrue(old.retired)
+        self.assertTrue(old_ws.send_cancelled.is_set())
+        self.assertEqual(old_ws.close_codes, [4002])
+        self.assertIs(hub.devboxes["box"], new)
+        self.assertNotIn("old", hub.agent_to_devbox)
+        self.assertEqual(hub.agent_to_devbox["new"], "box")
+        self.assertFalse(await hub.remove_devbox("box", expected=old))
+        self.assertIs(hub.devboxes["box"], new)
+        self.assertTrue(await hub.remove_devbox("box", expected=new))
 
     async def test_sync_agents_drops_removed_agent_routes(self):
         hub = Hub()
@@ -184,6 +241,33 @@ class HubSyncAgentsTests(unittest.IsolatedAsyncioTestCase):
         hub = Hub()
         pushed = await hub.sync_agents("ghost", {"a1"}, [])
         self.assertFalse(pushed)
+
+    async def test_retire_agent_sessions_notifies_watchers_and_clears_presence(self):
+        hub = Hub()
+        devbox = DevboxConn(ws=RecorderWebSocket(), devbox_id="d1",
+                            agent_ids={"a1"})
+        await hub.add_devbox(devbox)
+        devbox.active_session_ids.update({"s1", "keep"})
+        human_ws = RecorderWebSocket()
+        human = HumanConn(ws=human_ws, user_id="u1")
+        hub.add_human(human)
+        hub.watch(human, "s1", "a1")
+        hub.watch(human, "keep", "a1")
+
+        await hub.retire_agent_sessions("a1", {"s1"})
+        await asyncio.sleep(0)
+
+        self.assertNotIn("s1", devbox.active_session_ids)
+        self.assertIn("keep", devbox.active_session_ids)
+        self.assertNotIn("s1", human.sessions)
+        self.assertIn("keep", human.sessions)
+        self.assertNotIn("s1", hub.session_watchers)
+        self.assertEqual(human_ws.sent[-1], {
+            "type": "exit", "agent_id": "a1", "session_id": "s1",
+            "code": 0, "reason": "agent_deleted",
+        })
+        hub.remove_human(human)
+        await hub.remove_devbox("d1", expected=devbox)
 
 
 if __name__ == "__main__":

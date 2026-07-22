@@ -218,12 +218,15 @@ class SessionSupervisor:
         self.pending_event.set()
 
     def _reconcile_inflight_after_fence(self) -> None:
-        """Drop in-flight durable ids whose spool rows a fence just purged."""
-        valid = {ordv for ordv, _ in self._spool.pending_records()}
+        """Drop in-flight ids whose durable or control frame was purged."""
+        valid_durable = {ordv for ordv, _ in self._spool.pending_records()}
+        valid_controls = {delivery_id for delivery_id, _ in self._controls}
         for delivery_id in list(self._inflight_ids):
             if isinstance(delivery_id, str) and delivery_id.startswith("control:"):
-                continue
-            if delivery_id not in valid:
+                valid = delivery_id in valid_controls
+            else:
+                valid = delivery_id in valid_durable
+            if not valid:
                 size = self._inflight_ids.pop(delivery_id, 0)
                 if size:
                     self._inflight_bytes -= size
@@ -252,12 +255,53 @@ class SessionSupervisor:
                 self.pending_event.set()
             return
         if t == "agents":
-            # Cloud-side agent directory changed (agent added/removed) while we
-            # stay connected. Refresh the runtime lookup so a freshly created
-            # agent can be opened immediately -- no connector restart needed.
-            directory = frame.get("agents")
-            if isinstance(directory, list):
-                self.agents = {a["id"]: a for a in directory if a.get("id")}
+            # Hot directory refresh pushed after mutations and every transport
+            # connect. Keep the same id -> config shape populated by /api/me.
+            # Invalid payloads are ignored so a malformed frame cannot erase
+            # the directory. Sessions belonging to a deleted agent are stopped
+            # locally as part of authoritative directory reconciliation.
+            agents = frame.get("agents")
+            if not isinstance(agents, list):
+                return
+            # The directory is authoritative, so an empty list intentionally
+            # removes every agent. Reject a partly malformed list as a whole,
+            # though, rather than interpreting bad input as mass deletion.
+            if any(not isinstance(agent, dict)
+                   or not isinstance(agent.get("id"), str)
+                   or not agent["id"].strip()
+                   for agent in agents):
+                return
+            updated = {agent["id"]: dict(agent) for agent in agents}
+            removed_agent_ids = set(self.agents) - set(updated)
+            self.agents = updated
+            if removed_agent_ids:
+                removed_streams: set[tuple[str, str]] = set()
+                for _delivery_id, pending in self._spool.pending_records():
+                    session_id = pending.get("session_id")
+                    pty_instance_id = pending.get("pty_instance_id")
+                    if (pending.get("agent_id") in removed_agent_ids
+                            and isinstance(session_id, str)
+                            and isinstance(pty_instance_id, str)):
+                        removed_streams.add((session_id, pty_instance_id))
+                for key, pty_instance_id in self.pty_instances.items():
+                    if key[0] in removed_agent_ids:
+                        removed_streams.add((key[1], pty_instance_id))
+                for session_id, pty_instance_id in removed_streams:
+                    self._spool.fence(session_id, pty_instance_id)
+                self._controls = deque(
+                    (delivery_id, pending)
+                    for delivery_id, pending in self._controls
+                    if pending.get("agent_id") not in removed_agent_ids
+                )
+                self._reconcile_inflight_after_fence()
+                for key, pty in list(self.ptys.items()):
+                    if key[0] in removed_agent_ids:
+                        try:
+                            pty.kill()
+                        except Exception:
+                            pass
+                        self.ptys.pop(key, None)
+                        self.pty_instances.pop(key, None)
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
@@ -358,6 +402,8 @@ class SessionSupervisor:
         structured = runtimes.has(runtime_id) and runtimes.get(runtime_id).structured
 
         async def on_output(data: str):
+            if agent_id not in self.agents:
+                return
             frame = {"type": "output", "agent_id": agent_id,
                      "session_id": session_id,
                      "pty_instance_id": pty_instance_id,

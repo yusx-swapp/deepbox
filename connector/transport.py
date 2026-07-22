@@ -59,20 +59,29 @@ class TransportSession:
     async def run(self, ws) -> None:
         """Pump frames both ways until any direction ends."""
         await self.channel.send({"type": "list_sessions"})
-        ws_to_channel = asyncio.create_task(self._ws_to_channel(ws))
-        channel_to_ws = asyncio.create_task(self._channel_to_ws(ws))
-        server_events = asyncio.create_task(self._process_server_events(ws))
-        heartbeat = asyncio.create_task(heartbeat_loop(ws))
-        done, pending = await asyncio.wait(
-            {ws_to_channel, channel_to_ws, server_events, heartbeat},
-            return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            exc = task.exception()
-            if exc:
-                raise exc
+        tasks = (
+            asyncio.create_task(self._ws_to_channel(ws)),
+            asyncio.create_task(self._channel_to_ws(ws)),
+            asyncio.create_task(self._process_server_events(ws)),
+            asyncio.create_task(heartbeat_loop(ws)),
+        )
+        results: list[object] = []
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # More than one WebSocket task can fail in the same event-loop
+            # turn when a connection drops. Always cancel and retrieve every
+            # child result before propagating one error; otherwise asyncio logs
+            # "Task exception was never retrieved" during normal reconnects.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = list(await asyncio.gather(*tasks, return_exceptions=True))
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                raise result
 
     async def _ws_to_channel(self, ws) -> None:
         async for raw in ws:

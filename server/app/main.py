@@ -662,10 +662,10 @@ async def remove_workspace_member(workspace_id: str, user_id: str, request: Requ
 def _agent_json(a: Agent) -> dict:
     return {"id": a.id, "handle": a.handle, "display_name": a.display_name,
             "runtime": a.runtime, "cwd": a.cwd, "launch_cmd": a.launch_cmd,
-            "presence": "online" if hub.is_agent_online(a.id) else a.presence}
+            "presence": "online" if hub.is_agent_online(a.id) else "offline"}
 
 
-def _connector_agent_dir(d: Devbox) -> list[dict]:
+def _connector_agent_dir(agents: list[Agent]) -> list[dict]:
     """Agent directory in the shape the connector's supervisor consumes.
 
     Mirrors the ``/api/me`` payload (id/handle/runtime/cwd/launch_cmd) so a
@@ -674,21 +674,32 @@ def _connector_agent_dir(d: Devbox) -> list[dict]:
     """
     return [{"id": a.id, "handle": a.handle, "runtime": a.runtime,
              "cwd": a.cwd, "launch_cmd": a.launch_cmd}
-            for a in d.agents]
+            for a in agents]
 
 
-async def _push_agent_directory(s: OrmSession, devbox_id: str) -> None:
-    """Push the current agent set to an online connector (no-op if offline).
+_agent_directory_locks: dict[str, asyncio.Lock] = {}
 
-    Called after an agent is created or deleted so the change takes effect
-    without the user restarting the connector. Reloads the devbox so
-    ``d.agents`` reflects the just-committed mutation.
+
+async def _push_agent_directory(devbox_id: str) -> None:
+    """Queue an authoritative agent set for an online connector.
+
+    Per-devbox serialization prevents two concurrent create/delete requests
+    from publishing full-directory snapshots out of order. A short-lived
+    session makes each snapshot fresh and avoids holding a read transaction
+    open for the lifetime of a connector WebSocket.
     """
-    d = s.get(Devbox, devbox_id)
-    if d is None:
-        return
-    directory = _connector_agent_dir(d)
-    await hub.sync_agents(devbox_id, {a.id for a in d.agents}, directory)
+    lock = _agent_directory_locks.setdefault(devbox_id, asyncio.Lock())
+    async with lock:
+        directory_db = models.SessionLocal()
+        try:
+            agents = list(directory_db.scalars(
+                select(Agent).where(Agent.devbox_id == devbox_id)
+                .order_by(Agent.created_at, Agent.id)
+            ).all())
+        finally:
+            directory_db.close()
+        directory = _connector_agent_dir(agents)
+        await hub.sync_agents(devbox_id, {a.id for a in agents}, directory)
 
 
 def _ensure_personal_workspace(s: OrmSession, u: User) -> Workspace:
@@ -746,7 +757,7 @@ def _lease_json(s: OrmSession, sess: Session, user_id: str, role: str) -> dict:
 
 def _devbox_json(d: Devbox) -> dict:
     return {"id": d.id, "name": d.name, "workspace_id": d.workspace_id,
-            "online": d.id in hub.devboxes,
+            "online": hub.is_devbox_online(d.id),
             "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             "capabilities": d.capabilities,
             "agents": [_agent_json(a) for a in d.agents]}
@@ -871,7 +882,7 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
     )
     s.add(a)
     s.commit()
-    await _push_agent_directory(s, d.id)
+    await _push_agent_directory(d.id)
     return _agent_json(a)
 
 
@@ -883,9 +894,15 @@ async def delete_agent(agent_id: str, request: Request, s: OrmSession = Depends(
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
     devbox_id = a.devbox_id
+    session_ids = {
+        row[0] for row in s.query(Session.id).filter(Session.agent_id == a.id).all()
+    }
     s.delete(a)
     s.commit()
-    await _push_agent_directory(s, devbox_id)
+    await hub.retire_agent_sessions(a.id, session_ids)
+    for session_id in session_ids:
+        live_registry.drop(session_id)
+    await _push_agent_directory(devbox_id)
     return {"ok": True}
 
 
@@ -1127,13 +1144,21 @@ async def ws_devbox(ws: WebSocket):
     s.commit()
     await ws.accept()
     conn = DevboxConn(ws=ws, devbox_id=d.id, agent_ids=agent_ids)
-    await hub.add_devbox(conn)
+    await hub.add_devbox(conn, initial_frames=({
+        "type": "hello", "devbox_id": d.id,
+        "agent_ids": list(agent_ids),
+        "protocol_version": PROTOCOL_VERSION},))
     log_event(logger, "connector.online", devbox_id=d.id,
               agent_count=len(agent_ids))
-    await ws.send_json({"type": "hello", "devbox_id": d.id,
-                        "agent_ids": list(agent_ids),
-                        "protocol_version": PROTOCOL_VERSION})
+
+    async def send_connector(frame: dict) -> None:
+        if not hub.send_devbox(conn, frame):
+            raise WebSocketDisconnect(code=1011)
+
     try:
+        # Reconcile from a fresh committed snapshot after every transport
+        # connect, closing the fetch_me -> WebSocket mutation race.
+        await _push_agent_directory(d.id)
         while True:
             frame = await ws.receive_json()
             t = frame.get("type")
@@ -1144,7 +1169,7 @@ async def ws_devbox(ws: WebSocket):
                 if dd:
                     dd.last_seen_at = now()
                     s.commit()
-                await ws.send_json({"type": "heartbeat_ack",
+                await send_connector({"type": "heartbeat_ack",
                                     "ts": now().isoformat()})
                 log_event(logger, "connector.heartbeat",
                           level=_logging.DEBUG, devbox_id=d.id)
@@ -1178,7 +1203,7 @@ async def ws_devbox(ws: WebSocket):
                         commit = await asyncio.to_thread(
                             recording_store.commit_new, s, pending_row)
                         if commit.outcome == NEW:
-                            await ws.send_json({
+                            await send_connector({
                                 "type": "ack", "session_id": sid,
                                 "pty_instance_id": frame.get("pty_instance_id"),
                                 "seq": frame.get("seq")})
@@ -1199,19 +1224,19 @@ async def ws_devbox(ws: WebSocket):
                             # Lost a durable race (DUPLICATE/CONFLICT/GAP). The
                             # frame was already shown; respond so the connector
                             # can reconcile (re-ACK / fence / resend).
-                            await ws.send_json(output_ack_response(
+                            await send_connector(output_ack_response(
                                 commit, session_id=sid,
                                 pty_instance_id=frame.get("pty_instance_id"),
                                 seq=frame.get("seq")))
                     elif result.outcome == DUPLICATE:
                         # Already durable and identical: re-ACK, do NOT re-feed
                         # or re-broadcast.
-                        await ws.send_json(output_ack_response(
+                        await send_connector(output_ack_response(
                             result, session_id=sid,
                             pty_instance_id=frame.get("pty_instance_id"),
                             seq=frame.get("seq")))
                     elif result.outcome == GAP:
-                        await ws.send_json(output_ack_response(
+                        await send_connector(output_ack_response(
                             result, session_id=sid,
                             pty_instance_id=frame.get("pty_instance_id"),
                             seq=frame.get("seq")))
@@ -1220,7 +1245,7 @@ async def ws_devbox(ws: WebSocket):
                         # than wedging the connector's single-inflight loop.
                         log_event(logger, "recording.conflict", devbox_id=d.id,
                                   session_id=sid, seq=frame.get("seq"))
-                        await ws.send_json(output_ack_response(
+                        await send_connector(output_ack_response(
                             result, session_id=sid,
                             pty_instance_id=frame.get("pty_instance_id"),
                             seq=frame.get("seq")))
@@ -1229,7 +1254,7 @@ async def ws_devbox(ws: WebSocket):
                                   session_id=sid, reason=result.reason)
                         # "seq below persisted frontier" -> recoverable fence;
                         # any other INVALID stays a terminal error.
-                        await ws.send_json(output_ack_response(
+                        await send_connector(output_ack_response(
                             result, session_id=sid,
                             pty_instance_id=frame.get("pty_instance_id"),
                             seq=frame.get("seq")))
@@ -1282,16 +1307,17 @@ async def ws_devbox(ws: WebSocket):
                 d2 = s.get(Devbox, d.id)
                 d2.capabilities = frame.get("capabilities")
                 s.commit()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError, OSError):
         pass
     finally:
-        await hub.remove_devbox(d.id)
-        log_event(logger, "connector.offline", devbox_id=d.id)
-        dd = s.get(Devbox, d.id)
-        if dd:
-            for a in dd.agents:
-                a.presence = "offline"
-            s.commit()
+        removed = await hub.remove_devbox(d.id, expected=conn)
+        if removed:
+            log_event(logger, "connector.offline", devbox_id=d.id)
+            dd = s.get(Devbox, d.id)
+            if dd:
+                for a in dd.agents:
+                    a.presence = "offline"
+                s.commit()
         s.close()
 
 

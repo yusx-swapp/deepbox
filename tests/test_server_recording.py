@@ -40,6 +40,9 @@ class RecordingBaseCase(unittest.TestCase):
                           display_name="A"))
         self.db.add(models.Agent(id=self.agB, devbox_id=self.dbxB, handle="b",
                           display_name="B"))
+        # Raw foreign-key IDs do not establish ORM dependency edges, so flush
+        # the parent rows before inserting the child while FK checks are on.
+        self.db.flush()
         self.sid = "s-" + uuid.uuid4().hex
         self.db.add(models.Session(id=self.sid, user_id=self.uid, agent_id=self.agA,
                               title="S"))
@@ -582,6 +585,13 @@ class OutputAckResponseTests(unittest.TestCase):
     def test_invalid_below_frontier_is_fence(self):
         r = self._r(INVALID, reason="seq 5 below persisted frontier 40")
         self.assertEqual(r["type"], "fence")
+
+    def test_unknown_deleted_session_is_fence(self):
+        r = self._r(INVALID, reason="unknown session")
+        self.assertEqual(r, {
+            "type": "fence", "session_id": "s", "pty_instance_id": "p",
+            "seq": 42, "message": "session deleted; abandon this pty_instance",
+        })
 
     def test_invalid_other_stays_terminal_error(self):
         r = self._r(INVALID, reason="not owned by this devbox")

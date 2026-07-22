@@ -229,5 +229,42 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(supervisor_end.recv(), timeout=0.02)
 
 
+class TransportLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_retrieves_all_child_failures_and_leaves_no_tasks(self):
+        class ClosingWebSocket:
+            def __init__(self):
+                self.closing = asyncio.Event()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await self.closing.wait()
+                raise ConnectionError("receive closed")
+
+            async def send(self, _payload):
+                self.closing.set()
+                raise ConnectionError("send closed")
+
+        supervisor_end, transport_end = LoopbackChannel.pair()
+        transport = TransportSession(transport_end)
+        await supervisor_end.send({"type": "sessions", "sessions": []})
+        loop = asyncio.get_running_loop()
+        contexts = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+        before = set(asyncio.all_tasks())
+        try:
+            with self.assertRaises(ConnectionError):
+                await transport.run(ClosingWebSocket())
+            await asyncio.sleep(0)
+            leaked = [task for task in asyncio.all_tasks()
+                      if task not in before and not task.done()]
+            self.assertEqual(leaked, [])
+            self.assertEqual(contexts, [])
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+
 if __name__ == "__main__":
     unittest.main()

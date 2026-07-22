@@ -86,6 +86,62 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
         await sup.handle_control({"type": "agents", "agents": "nonsense"})
         self.assertEqual(set(sup.agents), {"a"})
+        await sup.handle_control({
+            "type": "agents", "agents": [{"id": "a"}, {}]})
+        self.assertEqual(set(sup.agents), {"a"})
+
+    async def test_agents_frame_kills_sessions_for_removed_agent(self):
+        class FakePty:
+            def __init__(self):
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+
+        removed_pty = FakePty()
+        kept_pty = FakePty()
+        sup = SessionSupervisor({
+            "removed": {"id": "removed", "runtime": "mock"},
+            "kept": {"id": "kept", "runtime": "mock"},
+        })
+        sup.ptys = {
+            ("removed", "s1"): removed_pty,
+            ("kept", "s2"): kept_pty,
+        }
+        sup.pty_instances = {
+            ("removed", "s1"): "old-removed",
+            ("kept", "s2"): "old-kept",
+        }
+        sup.emit({
+            "type": "output", "agent_id": "removed", "session_id": "s1",
+            "pty_instance_id": "old-removed", "seq": 0, "data": "stale",
+        })
+        sup.emit({"type": "presence", "agent_id": "removed",
+                  "session_id": "s1", "state": "online"})
+        removed_control_id = sup._controls[-1][0]
+        sup._inflight_ids[removed_control_id] = 0
+
+        await sup.handle_control({
+            "type": "agents",
+            "agents": [{"id": "kept", "runtime": "mock"}],
+        })
+
+        self.assertEqual(set(sup.agents), {"kept"})
+        self.assertNotIn(("removed", "s1"), sup.ptys)
+        self.assertNotIn(("removed", "s1"), sup.pty_instances)
+        self.assertFalse(any(
+            frame.get("agent_id") == "removed"
+            for _delivery_id, frame in sup._spool.pending_records()
+        ))
+        self.assertFalse(any(
+            frame.get("agent_id") == "removed"
+            for _delivery_id, frame in sup._controls
+        ))
+        self.assertNotIn(removed_control_id, sup._inflight_ids)
+        self.assertIn(("kept", "s2"), sup.ptys)
+        self.assertEqual(sup.pty_instances[("kept", "s2")], "old-kept")
+        self.assertTrue(removed_pty.killed)
+        self.assertFalse(kept_pty.killed)
 
     async def test_transport_restart_does_not_kill_pty(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})

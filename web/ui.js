@@ -32,6 +32,24 @@
     return value || 'runtime';
   }
 
+  function runtimeOptions(capabilities){
+    if(!Array.isArray(capabilities)) return [];
+    const seen = new Set();
+    const options = [];
+    for(const value of capabilities){
+      if(typeof value !== 'string') continue;
+      const id = value.trim();
+      if(!id || seen.has(id)) continue;
+      seen.add(id);
+      options.push(id);
+    }
+    return options;
+  }
+
+  function agentApiPath(agentId){
+    return `/api/agents/${encodeURIComponent(String(agentId || ''))}`;
+  }
+
   // Generate the exact Windows connector bootstrap command shown after a
   // devbox token is minted. Keeping this pure makes wrapping/copy regressions
   // testable without a browser. Emits a single self-contained PowerShell block:
@@ -258,6 +276,8 @@
     escapeHtml: escapeHtml,
     initials: initials,
     runtimeLabel: runtimeLabel,
+    runtimeOptions: runtimeOptions,
+    agentApiPath: agentApiPath,
     windowsConnectorCommand: windowsConnectorCommand,
     unixConnectorCommand: unixConnectorCommand,
     shouldFocusTerminal: shouldFocusTerminal,

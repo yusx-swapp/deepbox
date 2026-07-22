@@ -100,9 +100,9 @@ def output_ack_response(result: "PersistResult", *, session_id, pty_instance_id,
       terminal error here wedges the connector's single-inflight send loop
       forever (reconnect -> resend poison frame -> CONFLICT -> ...), so we emit
       a recoverable fence telling it to abandon this pty_instance's spool tail.
-    - INVALID with "below persisted frontier" -> ``fence`` (stale superseded
-      tail for a forked pty_instance); any other INVALID stays a terminal
-      ``error`` (genuinely malformed / not owned).
+    - INVALID with "unknown session" -> ``fence`` (the session was deleted),
+      as does "below persisted frontier" (stale superseded tail); any other
+      INVALID stays a terminal ``error`` (genuinely malformed / not owned).
     """
     base = {"session_id": session_id, "pty_instance_id": pty_instance_id}
     if result.outcome in (NEW, DUPLICATE):
@@ -113,6 +113,9 @@ def output_ack_response(result: "PersistResult", *, session_id, pty_instance_id,
         return {"type": "fence", **base, "seq": seq,
                 "message": "pty_instance stream forked; abandon this spool tail"}
     reason = result.reason or "invalid output frame"
+    if reason == "unknown session":
+        return {"type": "fence", **base, "seq": seq,
+                "message": "session deleted; abandon this pty_instance"}
     if "below persisted frontier" in reason:
         return {"type": "fence", **base, "seq": seq,
                 "message": "stale spool tail below frontier; "

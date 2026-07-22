@@ -328,6 +328,9 @@ def _tune_sqlite(engine) -> None:
         try:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
+            # SQLite does not enforce declared ON DELETE cascades unless this
+            # is enabled separately for every database connection.
+            cur.execute("PRAGMA foreign_keys=ON")
             cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA wal_autocheckpoint=1000")
         finally:

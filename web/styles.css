@@ -271,7 +271,8 @@ h2,h3,h4{margin:0;font-weight:650;letter-spacing:-0.01em}
 .agent-handle .rt{color:var(--fg-faint);font-weight:400;font-size:12px;margin-left:5px;font-family:var(--font-mono)}
 .agent-meta{display:flex;align-items:center;gap:8px;margin-top:1px}
 .agent-actions{display:flex;gap:4px;opacity:0;transition:opacity .12s ease}
-.agent-row:hover .agent-actions,.agent-row.is-active .agent-actions{opacity:1}
+.agent-row:hover .agent-actions,.agent-row.is-active .agent-actions,
+.agent-actions:focus-within{opacity:1}
 .agent-actions button{padding:3px 7px;font-size:11px}
 .box-empty{padding:10px 11px;color:var(--fg-faint);font-size:12px}
 .box-foot{display:flex;gap:6px;padding:8px 11px;border-top:1px solid var(--border-faint)}

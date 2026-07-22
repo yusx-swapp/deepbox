@@ -132,7 +132,11 @@ def test_owner_can_securely_erase_recording_payload_and_checkpoints():
                            handle="erase", display_name="Erase", runtime="opaque")
         run = main.Session(id="erase-session", user_id=owner["id"], agent_id=agent.id,
                            retention="permanent")
-        session.add_all([devbox, agent, run])
+        session.add(devbox)
+        session.flush()
+        session.add(agent)
+        session.flush()
+        session.add(run)
         session.flush()
         frame = main.models.RecordingFrame(
             session_id=run.id, pty_instance_id="pty", seq=1, kind="o",

@@ -12,6 +12,7 @@ if(!document.querySelector('link[data-deepbox-styles]')){
   document.head.appendChild(link);
 }
 let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession = null;
+let fleetLoadRequest = 0;
 let replayMode = false;
 let curAgentId = null;   // currently open agent, for active-row highlighting
 let fleetQuery = '';     // fleet search text
@@ -205,11 +206,16 @@ function renderBootstrap() {
 async function boot() {
   try { me = me || await api('/api/me/user'); }
   catch { return renderLogin(); }
-  await loadDevboxes();
-  renderShell();
+  if (await loadDevboxes()) renderShell();
 }
 
-async function loadDevboxes(){ devboxes = await api('/api/devboxes'); }
+async function loadDevboxes(){
+  const request = ++fleetLoadRequest;
+  const loaded = await api('/api/devboxes');
+  if(request !== fleetLoadRequest) return false;
+  devboxes = loaded;
+  return true;
+}
 
 function renderShell() {
   closeOverlay();
@@ -266,6 +272,7 @@ function renderFleet() {
         </div>
         <div class="agent-actions">
           <button class="ghost" data-hist="${esc(a.id)}" data-histname="${esc(a.display_name)}">History</button>
+          <button class="danger" data-agent-del="${esc(a.id)}" data-agent-delname="${esc(a.display_name||a.handle)}">Delete</button>
         </div>
       </div>`;
     }).join('') || '<div class="box-empty">No agents on this devbox yet.</div>';
@@ -319,12 +326,16 @@ function renderFleet() {
 
   fleet.querySelectorAll('[data-agent]').forEach(b=>b.onclick=()=>createAgent(b.dataset.agent));
   fleet.querySelectorAll('[data-open]').forEach(b=>b.onclick=(e)=>{
-    if(e.target.closest('[data-hist]')) return;
+    if(e.target.closest('[data-hist],[data-agent-del]')) return;
     openAgent(b.dataset.open, b.dataset.name);
   });
   fleet.querySelectorAll('[data-hist]').forEach(b=>b.onclick=(e)=>{
     e.stopPropagation();
     openHistory(b.dataset.hist, b.dataset.histname);
+  });
+  fleet.querySelectorAll('[data-agent-del]').forEach(b=>b.onclick=(e)=>{
+    e.stopPropagation();
+    deleteAgent(b.dataset.agentDel, b.dataset.agentDelname);
   });
   fleet.querySelectorAll('[data-token]').forEach(b=>b.onclick=()=>rotateToken(b.dataset.token));
   fleet.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>delDevbox(b.dataset.del));
@@ -436,7 +447,7 @@ async function createDevbox() {
     submit:'Create'});
   if(!name) return;
   const res = await api('/api/devboxes',{method:'POST',body:JSON.stringify({name:name.name})});
-  await loadDevboxes(); renderFleet();
+  if (await loadDevboxes()) renderFleet();
   await showToken(res.token);
 }
 // Present a one-time devbox token. Rendered from memory into a modal only;
@@ -501,21 +512,49 @@ async function delDevbox(id){
     'This removes the devbox and all of its agents. This cannot be undone.', 'Delete');
   if(!ok) return;
   await api(`/api/devboxes/${id}`,{method:'DELETE'});
-  await loadDevboxes(); renderFleet();
+  if (await loadDevboxes()) renderFleet();
 }
 async function createAgent(devboxId){
-  const res = await showForm({
-    title:'Add agent', desc:'Register an agent runtime on this devbox.',
+  const d=devboxes.find(x=>x.id===devboxId);
+  if(!d) return;
+  const runtimes = ui.runtimeOptions(d.capabilities);
+  if(!runtimes.length){
+    await showAlert('No runtimes reported',
+      'Start or reconnect this machine so the connector can report its available runtime adapters.');
+    return;
+  }
+  const res=await showForm({
+    title:'Add agent', desc:`Register an agent runtime on ${d.name}.`,
     fields:[
       {name:'handle', label:'Handle', placeholder:'e.g. claude', required:true},
-      {name:'runtime', label:'Runtime adapter ID', placeholder:'e.g. claude-code', required:true},
+      {name:'runtime', label:'Runtime adapter', type:'select', options:runtimes, required:true},
       {name:'cwd', label:'Working directory (optional)', placeholder:'blank = default'},
     ], submit:'Add agent'});
-  if(!res) return;
-  await api(`/api/devboxes/${devboxId}/agents`,{method:'POST',
-    body:JSON.stringify({handle:res.handle, display_name:res.handle,
-      runtime:res.runtime.trim(), cwd:res.cwd||null})});
-  await loadDevboxes(); renderFleet();
+  if(!res)return;
+  try{
+    await api(`/api/devboxes/${devboxId}/agents`,{method:'POST',
+      body:JSON.stringify({handle:res.handle, display_name:res.handle,
+        runtime:res.runtime, cwd:res.cwd||null})});
+    if (await loadDevboxes()) renderFleet();
+  }catch(error){
+    try{ if (await loadDevboxes()) renderFleet(); }catch(_refreshError){}
+    await showAlert('Agent could not be added', error.message || 'The request failed.');
+  }
+}
+
+async function deleteAgent(agentId, name){
+  const ok = await showConfirm('Delete agent?',
+    `Delete ${name || 'this agent'}? Saved sessions and any running session for this agent will be removed.`,
+    'Delete agent');
+  if(!ok) return;
+  try{
+    await api(ui.agentApiPath(agentId), {method:'DELETE'});
+    if(curAgentId === agentId) clearAgentView();
+    if (await loadDevboxes()) renderFleet();
+  }catch(error){
+    try{ if (await loadDevboxes()) renderFleet(); }catch(_refreshError){}
+    await showAlert('Agent could not be deleted', error.message || 'The request failed.');
+  }
 }
 
 // ---------------- terminal ----------------
@@ -864,6 +903,26 @@ function stopReplay(){
   replayPlaying = false;
   if(replayTimer){ clearTimeout(replayTimer); replayTimer = null; }
   if(term) term.options && (term.options.disableStdin = false);
+}
+
+function clearAgentView(){
+  stopReplay();
+  const replaybar = document.getElementById('replaybar');
+  if(replaybar) replaybar.remove();
+  wantOpen = false;
+  if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if(termInputSender){ termInputSender.close(); termInputSender = null; }
+  if(termWS){ try{ termWS.onclose=null; termWS.close(); }catch(e){} termWS=null; }
+  if(term){ try{ term.dispose(); }catch(e){} term=null; fit=null; }
+  curAgentId = null;
+  curSession = null;
+  collabState = null;
+  structuredMode = false;
+  chatState = null;
+  replay = null;
+  replayAgentId = null;
+  replayAgentName = '';
+  renderStageEmpty();
 }
 
 async function openHistory(agentId, name){

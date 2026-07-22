@@ -46,13 +46,13 @@ py -3 -m venv .venv
 ::   .venv\Scripts\python -m pip install -r requirements-connector.txt
 :: 1) 启动本地开发 server（默认 127.0.0.1:8077）
 .venv\Scripts\python -m server
-:: 2) 浏览器打开 http://localhost:8077，注册/登录，创建 Devbox（复制 token），
-::    在该 Devbox 下建一个 runtime=mock 的 agent
-:: 3) 启动 connector（新终端）
+:: 2) 浏览器打开 http://localhost:8077，注册/登录，创建 Devbox 并复制一次性 token
+:: 3) 启动 connector（新终端）；它会探测并上报本机可用 runtime
 set DEEPBOX_SERVER_URL=http://localhost:8077
 set DEEPBOX_TOKEN=hpc_box_...
 .venv\Scripts\python -m connector
-:: 4) 回到 web，打开那个 agent 的终端，开始交互
+:: 4) 回到 Fleet 添加 Agent，从下拉框选择 mock，再打开终端交互
+::    Agent 可直接删除；在线 connector 会立即同步新增和删除，无需重连
 ```
 
 ## Web UI 快捷键
