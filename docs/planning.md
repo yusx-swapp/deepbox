@@ -421,11 +421,16 @@ deepbox-connector
 ### CLI
 
 ```text
-deepbox connect <token>
+# 已落地；token 通过 DEEPBOX_TOKEN 或 --token 提供
+deepbox connect
 deepbox status
+deepbox doctor
+deepbox project add|remove|list|sync
+deepbox upgrade
+
+# 仍在规划
 deepbox sessions
 deepbox logs
-deepbox doctor
 deepbox disconnect
 ```
 

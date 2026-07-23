@@ -57,22 +57,38 @@ test('agentApiPath safely addresses opaque agent IDs', () => {
     '/api/agents/agent%2Fwith%20spaces');
 });
 
-test('windowsConnectorCommand is complete and directly copyable', () => {
+test('install commands are explicit one-time setup commands', () => {
   assert.equal(
-    ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test'),
-    '$env:DEEPBOX_SERVER_URL = "https://deepbox.example"\n' +
-      '$env:DEEPBOX_TOKEN = "hpc_box_test"\n' +
-      'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex'
+    ui.windowsInstallCommand(),
+    'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex'
+  );
+  assert.equal(
+    ui.unixInstallCommand(),
+    'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash && ' +
+      'export PATH="$HOME/.deepbox/bin:$PATH"'
   );
 });
 
-test('unixConnectorCommand mirrors the Windows one-liner for POSIX shells', () => {
+test('windowsConnectorCommand reconnects without invoking the installer', () => {
+  const command = ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test');
   assert.equal(
-    ui.unixConnectorCommand('https://deepbox.example', 'hpc_box_test'),
+    command,
+    '$env:DEEPBOX_SERVER_URL = "https://deepbox.example"\n' +
+      '$env:DEEPBOX_TOKEN = "hpc_box_test"\n' +
+      'deepbox connect'
+  );
+  assert.doesNotMatch(command, /install\.ps1|Invoke-WebRequest|\birm\b/);
+});
+
+test('unixConnectorCommand reconnects without invoking the installer', () => {
+  const command = ui.unixConnectorCommand('https://deepbox.example', 'hpc_box_test');
+  assert.equal(
+    command,
     'export DEEPBOX_SERVER_URL="https://deepbox.example"\n' +
       'export DEEPBOX_TOKEN="hpc_box_test"\n' +
-      'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash'
+      'deepbox connect'
   );
+  assert.doesNotMatch(command, /install\.sh|curl|wget/);
 });
 
 test('status helpers always return a text label', () => {

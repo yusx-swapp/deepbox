@@ -138,23 +138,29 @@
   // so the user never clones the repo or installs dependencies by hand.
   const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1';
   const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh';
+  function windowsInstallCommand(){
+    return 'irm ' + INSTALL_PS1_URL + ' | iex';
+  }
+  function unixInstallCommand(){
+    return 'curl -fsSL ' + INSTALL_SH_URL + ' | bash && export PATH="$HOME/.deepbox/bin:$PATH"';
+  }
   function windowsConnectorCommand(serverUrl, token){
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
     return [
       '$env:DEEPBOX_SERVER_URL = "' + server + '"',
       '$env:DEEPBOX_TOKEN = "' + secret + '"',
-      'irm ' + INSTALL_PS1_URL + ' | iex',
+      'deepbox connect',
     ].join('\n');
   }
-  // macOS / Linux equivalent (POSIX shell). Same hosted-installer approach.
+  // macOS / Linux equivalent. Connecting never runs the installer.
   function unixConnectorCommand(serverUrl, token){
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
     return [
       'export DEEPBOX_SERVER_URL="' + server + '"',
       'export DEEPBOX_TOKEN="' + secret + '"',
-      'curl -fsSL ' + INSTALL_SH_URL + ' | bash',
+      'deepbox connect',
     ].join('\n');
   }
 
@@ -422,6 +428,8 @@
     preferredSurface: preferredSurface,
     capabilityForSurface: capabilityForSurface,
     agentApiPath: agentApiPath,
+    windowsInstallCommand: windowsInstallCommand,
+    unixInstallCommand: unixInstallCommand,
     windowsConnectorCommand: windowsConnectorCommand,
     unixConnectorCommand: unixConnectorCommand,
     shouldFocusTerminal: shouldFocusTerminal,

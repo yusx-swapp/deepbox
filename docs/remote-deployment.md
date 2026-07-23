@@ -216,17 +216,17 @@ claude
 
 必须先在电脑 C 本地完成 Claude Code 登录。deepbox 不接触 Claude 凭证。
 
-### 5.2 安装 connector
+### 5.2 一次安装本地 `deepbox` command
 
-当前 Private Alpha 直接使用同一仓库：
+在 PowerShell 中运行一次：
 
-```bat
-cd /d C:\Code
-git clone https://github.com/yusx-swapp/deepbox.git
-cd /d C:\Code\deepbox
-py -3 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+```powershell
+irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
 ```
+
+installer 在当前用户的 `~\.deepbox` 下维护源码、独立 venv 和稳定 command，并把
+`~\.deepbox\bin` 加入用户 PATH。以后连接不再 clone、下载或刷新该目录；只有显式
+`deepbox upgrade` 才会重新运行 installer。
 
 ### 5.3 验证 Server 可达
 
@@ -240,11 +240,10 @@ curl https://server-name.example-tailnet.ts.net/api/health
 
 先设置从 UI 复制的 token，并运行 doctor：
 
-```bat
-cd /d C:\Code\deepbox
-set DEEPBOX_SERVER_URL=https://server-name.example-tailnet.ts.net
-set DEEPBOX_TOKEN=hpc_box_...
-.venv\Scripts\python -m connector --doctor
+```powershell
+$env:DEEPBOX_SERVER_URL = 'https://server-name.example-tailnet.ts.net'
+$env:DEEPBOX_TOKEN = 'hpc_box_...'
+deepbox doctor
 ```
 
 它依次检查 URL/TLS、`/api/health`、protocol version 和 token authentication；不会打印 token。
@@ -252,15 +251,14 @@ set DEEPBOX_TOKEN=hpc_box_...
 
 ### 5.5 启动 connector
 
-```bat
-scripts\start-connector.cmd
+保持同一组环境变量，运行：
+
+```powershell
+deepbox connect
 ```
 
-也可以直接：
-
-```bat
-.venv\Scripts\python -u -m connector
-```
+这个命令从当前工作目录启动已安装的 connector，不会调用 installer 或刷新
+`~\.deepbox\app`。
 
 connector 会：
 
@@ -279,14 +277,14 @@ Token 只通过 `Authorization: Bearer` header 发送；Server 不接受 WS quer
 默认命令仍是兼容的 all-in-one 模式。若要让网络 transport 独立重启而本地 PTY 继续存活，请在两个终端中使用
 相同的 `DEEPBOX_SERVER_URL` 和 `DEEPBOX_TOKEN` 环境变量。先启动长期驻留的 session supervisor：
 
-```bat
-.venv\Scripts\python -u -m connector --mode supervisor
+```powershell
+deepbox connect --mode supervisor
 ```
 
 再启动可重启的网络 transport：
 
-```bat
-.venv\Scripts\python -u -m connector --mode transport
+```powershell
+deepbox connect --mode transport
 ```
 
 两者通过当前用户专属的 Windows named pipe（POSIX 上为 `0600` Unix socket）通信，并使用当前用户本地密钥做

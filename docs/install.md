@@ -1,7 +1,8 @@
-# One-Line Installer
+# Install once, connect anytime
 
-deepbox ships two one-line installers so a user can connect a machine **without
-cloning the repo or installing dependencies by hand**:
+Install deepbox once as a local command. Daily connections use `deepbox connect`;
+they do **not** download code, rebuild the virtualenv, or replace
+`~/.deepbox/app`.
 
 ```powershell
 # Windows (PowerShell)
@@ -13,84 +14,100 @@ irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/instal
 curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
 ```
 
-## What the installer does
-
-1. Finds a Python 3.10+ interpreter (and prints install guidance if missing).
-2. Downloads the connector source as a zip from the **public** mirror
-   (`yusx-swapp/deepbox`) — anonymous, no GitHub access needed.
-3. On a Windows reinstall, finds a running `-m connector` process from this
-   installation's virtualenv and stops its connector-owned process tree before
-   replacing the source directory.
-4. Creates an isolated virtualenv under `~/.deepbox` and installs the
-   connector dependencies (`httpx`, `websockets`, and `pywinpty` on Windows).
-5. Writes a reusable launcher (`~/.deepbox/deepbox-connect.cmd` / `.sh`).
-6. Connects immediately using the server URL + devbox token.
-
-Everything lives under `~/.deepbox`; uninstall by deleting that folder. The
-**token is never written to disk** — it is passed to the connector process via
-an environment variable only.
-
-### Reinstalling while a Windows connector is running
-
-Re-running `install.ps1` detects only connector processes launched as
-`~\.deepbox\venv\Scripts\python.exe -m connector`, snapshots and stops their
-connector-owned child process tree, waits for the launcher to release
-`~\.deepbox\app`, and retries the directory replacement. This intentionally
-ends that connector's active local sessions before the new copy connects. It
-does not stop unrelated Python processes and never logs their command lines. If
-a separate shell itself has `~\.deepbox\app` as its working directory, leave
-that directory or close the shell and run the installer again.
-
-### Non-interactive use
-
-Pre-set the two values so the piped installer doesn't prompt:
-
-```powershell
-$env:DEEPBOX_SERVER_URL = 'https://deepbox-sixingyu-pa.azurewebsites.net'
-$env:DEEPBOX_TOKEN      = 'hpc_box_xxxxxxxx'
-irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
-```
+The Windows installer makes `deepbox` available in the current PowerShell
+session. On macOS/Linux, open a new terminal after installation or run:
 
 ```bash
-export DEEPBOX_SERVER_URL='https://deepbox-sixingyu-pa.azurewebsites.net'
-export DEEPBOX_TOKEN='hpc_box_xxxxxxxx'
-curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
+export PATH="$HOME/.deepbox/bin:$PATH"
 ```
 
-Set `DEEPBOX_SOURCE_ZIP` to install from a fork or a specific branch.
+## Connect a machine
 
-### Reconnecting later
-
-The generated launcher re-runs the connector without re-downloading anything:
+Sign in to the browser, create a devbox, and mint its one-time token. The token
+dialog generates the complete command for each platform:
 
 ```powershell
-# Windows — prompts for URL/token if not already in the environment
-%USERPROFILE%\.deepbox\deepbox-connect.cmd
+# Windows
+$env:DEEPBOX_SERVER_URL = 'https://deepbox.example'
+$env:DEEPBOX_TOKEN = 'hpc_box_xxxxxxxx'
+deepbox connect
 ```
 
 ```bash
 # macOS / Linux
-DEEPBOX_SERVER_URL=... DEEPBOX_TOKEN=... ~/.deepbox/deepbox-connect.sh
+export DEEPBOX_SERVER_URL='https://deepbox.example'
+export DEEPBOX_TOKEN='hpc_box_xxxxxxxx'
+deepbox connect
 ```
+
+`deepbox connect` runs from the caller's current directory and only starts the
+already-installed connector. It never invokes either installer. The token is
+passed through the process environment and is never written to disk by deepbox.
+
+## What the one-time installer does
+
+1. Finds a Python 3.10+ interpreter (and prints install guidance if missing).
+2. Downloads the connector source ZIP from the public `yusx-swapp/deepbox`
+   mirror, anonymously and without Git credentials.
+3. During a Windows install or explicit upgrade, finds connector processes from
+   this installation's virtualenv and stops their connector-owned process trees
+   before replacing the source directory.
+4. Refreshes `~/.deepbox/app`, creates or reuses `~/.deepbox/venv`, installs
+   the connector dependencies (`httpx`, `websockets`, and `pywinpty` on
+   Windows), and records the app location in the venv's `deepbox-app.pth`.
+5. Installs a stable command at `~/.deepbox/bin/deepbox.cmd` on Windows or
+   `~/.deepbox/bin/deepbox` on macOS/Linux. The shim starts Python with `-I`,
+   so the caller's working directory and `PYTHONPATH` cannot replace the
+   installed connector package; the installer then adds the bin directory to
+   the user's PATH.
+6. Writes `~/.deepbox/deepbox-connect.cmd` or `.sh` as a compatibility alias for
+   existing installations.
+
+If both `DEEPBOX_SERVER_URL` and `DEEPBOX_TOKEN` are already set, the installer
+runs diagnostics and connects after setup. Otherwise it installs only and tells
+the user to run `deepbox connect`.
+
+Everything managed by the installer lives under `~/.deepbox`. Set
+`DEEPBOX_HOME` to use a different root, or `DEEPBOX_SOURCE_ZIP` to install from a
+fork or pinned branch.
+
+## Reconnect and local commands
+
+Once installed, use the same command from any working directory:
+
+```text
+deepbox connect
+deepbox doctor
+deepbox status
+deepbox project add <path> [--name <display-name>]
+deepbox project list
+deepbox project remove <project-id>
+deepbox project sync
+```
+
+The legacy `~/.deepbox/deepbox-connect.cmd` / `.sh` launcher delegates to
+`deepbox connect`, so existing shortcuts continue to work.
 
 ### Managing local projects
 
-Project paths live only in the connector-local `~/.deepbox/state.db`. The
-server and browser receive a stable project ID and display name, never the path.
-Register a project before selecting it while creating an agent in the browser:
+Project paths live only in connector-local `state.db` under
+`%LOCALAPPDATA%\deepbox` on Windows or
+`${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The server and browser
+receive a stable project ID and display name, never the path. Register a project
+before selecting it while creating an agent in the browser:
 
 ```powershell
-& "$HOME\.deepbox\deepbox-connect.cmd" project add "C:\src\my-repo" --name "my-repo"
-& "$HOME\.deepbox\deepbox-connect.cmd" project list
-& "$HOME\.deepbox\deepbox-connect.cmd" project remove <project-id>
-& "$HOME\.deepbox\deepbox-connect.cmd" project sync
+deepbox project add "C:\src\my-repo" --name "my-repo"
+deepbox project list
+deepbox project remove <project-id>
+deepbox project sync
 ```
 
 ```bash
-~/.deepbox/deepbox-connect.sh project add "$HOME/src/my-repo" --name "my-repo"
-~/.deepbox/deepbox-connect.sh project list
-~/.deepbox/deepbox-connect.sh project remove <project-id>
-~/.deepbox/deepbox-connect.sh project sync
+deepbox project add "$HOME/src/my-repo" --name "my-repo"
+deepbox project list
+deepbox project remove <project-id>
+deepbox project sync
 ```
 
 `add` requires an existing directory and stores its canonical absolute path;
@@ -99,12 +116,33 @@ registration, not the directory. After synchronization, server-side agents that
 referenced the removed project lose that binding. `sync` sends the path-free
 project list without starting the long-running connector.
 
----
+## Upgrade explicitly
 
-# Hosting the scripts for one-line use
+Upgrade only when requested:
 
-The browser and examples use the anonymous GitHub Raw endpoints on the `main`
-branch:
+```text
+deepbox upgrade
+```
+
+The stable command downloads the current installer with
+`DEEPBOX_INSTALL_ONLY=1`. The installer may stop a running connector and refresh
+`~/.deepbox/app`; normal `deepbox connect` calls never do this. After an upgrade,
+run `deepbox connect` again if the previous connector was stopped.
+
+### Windows process safety during install or upgrade
+
+`install.ps1` matches only this installation's virtualenv Python running
+`-m connector` or `-m connector.cli`. It snapshots and stops that process's
+connector-owned child tree, waits for handles to be released, and retries the
+source-directory replacement. It does not stop unrelated Python processes and
+never logs inspected command lines.
+
+If a separate shell has manually changed its working directory to
+`~\.deepbox\app`, leave that directory or close the shell before upgrading.
+
+## Hosting the installer scripts
+
+The browser and examples use these anonymous GitHub Raw endpoints on `main`:
 
 ```text
 https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1
@@ -112,9 +150,8 @@ https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh
 ```
 
 The scripts are published by pushing the same reviewed commit to the public
-GitHub mirror; there is no separate Blob upload step. Keep `scripts/install.ps1`
-and `scripts/install.sh` in that commit so the UI command and downloaded source
-stay in sync.
+GitHub mirror; there is no separate Blob upload step. Keep both scripts in that
+commit so the UI command and downloaded source stay in sync.
 
 Verify both endpoints anonymously after publishing:
 

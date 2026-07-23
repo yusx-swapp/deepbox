@@ -23,12 +23,15 @@ over a Unix socket / Windows named pipe:
 
 The default remains all-in-one; the split is opt-in.
 
-Run:
+Run after one-time installation:
     set DEEPBOX_SERVER_URL=http://localhost:8077
     set DEEPBOX_TOKEN=hpc_box_...
-    python -m connector                     # all-in-one (default)
-    python -m connector --mode supervisor   # long-lived PTY owner (sessiond)
-    python -m connector --mode transport    # WS owner, reconnects to sessiond
+    deepbox connect                         # all-in-one (default)
+    deepbox connect --mode supervisor       # long-lived PTY owner (sessiond)
+    deepbox connect --mode transport        # WS owner, reconnects to sessiond
+
+From a source checkout, ``python -m connector`` remains the equivalent developer
+entry point.
 """
 from __future__ import annotations
 
@@ -460,7 +463,7 @@ async def _project_command(args) -> None:
         store.close()
 
 
-async def main():
+async def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser("deepbox-connector")
     ap.add_argument("--server-url", default=os.environ.get("DEEPBOX_SERVER_URL",
                                                             "http://localhost:8077"))
@@ -487,7 +490,7 @@ async def main():
                     help="check URL, TLS, health, protocol, and authentication, then exit")
     ap.add_argument("--status", action="store_true",
                     help="print connector/IPC configuration as JSON, then exit")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     mode_label = {
         "all-in-one": "all-in-one (supervisor+transport via loopback)",

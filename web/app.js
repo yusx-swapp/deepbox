@@ -93,7 +93,7 @@ function resetStructuredChat(){
 
 async function loadUI(){
   uiPromise = uiPromise || loadScriptOnce(
-    '/static/ui.js?cap=workspace-identity-v2',
+    '/static/ui.js?cap=local-cli-v1',
     'DeepboxUI',
     'failed to load compatible ui helpers',
     mod => typeof mod.createTerminalInputSender === 'function'
@@ -148,8 +148,8 @@ async function renderLogin() {
   const inviteFromUrl = pendingInvite;
   const passwordEnabled = authConfig.password_enabled !== false;
   const microsoftEnabled = authConfig.microsoft_enabled === true;
-  const psCmd = 'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex';
-  const shCmd = 'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash';
+  const psCmd = ui.windowsInstallCommand();
+  const shCmd = ui.unixInstallCommand();
   const microsoftHtml = microsoftEnabled ? `<button type="button" id="microsoft-login" class="microsoft-login" aria-label="Continue with Microsoft">
       <span class="microsoft-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
       Continue with Microsoft</button>` : '';
@@ -173,22 +173,22 @@ async function renderLogin() {
       <ul class="hero-points">
         <li><b>Bring your own agents.</b> Terminal (PTY) or structured chat mode, per agent.</li>
         <li><b>Nothing to trust us with.</b> No model keys, no code leaves your box unasked.</li>
-        <li><b>One-line onboarding.</b> No git clone, no dependency wrangling.</li>
+        <li><b>Install once, connect anytime.</b> No git clone, no dependency wrangling.</li>
       </ul>
       <div class="hero-install">
-        <div class="hero-install-h">Connect a machine in one line</div>
+        <div class="hero-install-h">Install the local command once</div>
         <div class="install-block">
           <div class="install-os">Windows &middot; PowerShell</div>
-          <div class="install-cmd"><code id="cmd-ps">${escapeHtml(psCmd)}</code><button class="ghost compact" id="copy-ps">Copy</button></div>
+          <div class="install-cmd"><code id="cmd-ps">${escapeHtml(psCmd)}</code><button class="ghost compact" id="copy-ps">Copy installer</button></div>
         </div>
         <div class="install-block">
           <div class="install-os">macOS / Linux</div>
-          <div class="install-cmd"><code id="cmd-sh">${escapeHtml(shCmd)}</code><button class="ghost compact" id="copy-sh">Copy</button></div>
+          <div class="install-cmd"><code id="cmd-sh">${escapeHtml(shCmd)}</code><button class="ghost compact" id="copy-sh">Copy installer</button></div>
         </div>
-        <p class="install-note">The installer sets up an isolated environment under
-          <code>~/.deepbox</code>, then asks for your server URL and a devbox token
-          (mint one after you sign in). Your token is passed to the connector via an
-          environment variable only &mdash; never written to disk.</p>
+        <p class="install-note">The installer creates an isolated environment and a
+          <code>deepbox</code> command under <code>~/.deepbox</code>. Sign in, mint a
+          devbox token, then run the generated <code>deepbox connect</code> command.
+          Reconnecting does not reinstall or refresh the app directory.</p>
       </div>
     </section>
     <div class="auth-card stack">
@@ -705,6 +705,8 @@ async function createDevbox() {
 // Present a one-time devbox token. Rendered from memory into a modal only;
 // never written to localStorage, cookies, the URL or the console.
 async function showToken(tok){
+  const windowsInstall = ui.windowsInstallCommand();
+  const unixInstall = ui.unixInstallCommand();
   const command = ui.windowsConnectorCommand(location.origin, tok);
   const unixCommand = ui.unixConnectorCommand(location.origin, tok);
   const bindCopy = (overlay, selector, text)=>{
@@ -724,17 +726,23 @@ async function showToken(tok){
   };
   await showModal({
     title:'Devbox token \u2014 shown once',
-    desc:'Copy this token now. The server stores only its hash and cannot show it again. Run one of the commands below on the machine you want to connect \u2014 no repo clone or manual setup needed.',
+    desc:'Copy this token now. On a new machine, install the local command once, then connect. Future deepbox connect calls never reinstall or refresh the app directory.',
       bodyHtml:`<div class="token-head"><b>Token</b><button class="ghost compact" id="copy-token">Copy token</button></div>
       <div class="token">${esc(tok)}</div>
-      <div class="token-head"><b>Windows \u00b7 PowerShell</b><button class="ghost compact" id="copy-command">Copy command</button></div>
+      <div class="token-head"><b>Windows \u00b7 one-time install</b><button class="ghost compact" id="copy-install">Copy installer</button></div>
+      <div class="token token-command">${esc(windowsInstall)}</div>
+      <div class="token-head"><b>Windows \u00b7 connect</b><button class="ghost compact" id="copy-command">Copy connect command</button></div>
       <div class="token token-command">${esc(command)}</div>
-      <div class="token-head"><b>macOS / Linux</b><button class="ghost compact" id="copy-command-unix">Copy command</button></div>
+      <div class="token-head"><b>macOS / Linux \u00b7 one-time install</b><button class="ghost compact" id="copy-install-unix">Copy installer</button></div>
+      <div class="token token-command">${esc(unixInstall)}</div>
+      <div class="token-head"><b>macOS / Linux \u00b7 connect</b><button class="ghost compact" id="copy-command-unix">Copy connect command</button></div>
       <div class="token token-command">${esc(unixCommand)}</div>`,
     actions:[{label:'Done', primary:true, value:true}],
     onReady:(overlay)=>{
       bindCopy(overlay, '#copy-token', tok);
+      bindCopy(overlay, '#copy-install', windowsInstall);
       bindCopy(overlay, '#copy-command', command);
+      bindCopy(overlay, '#copy-install-unix', unixInstall);
       bindCopy(overlay, '#copy-command-unix', unixCommand);
     }});
 }
@@ -804,7 +812,7 @@ async function createAgent(devboxId){
     .concat(projects.map(project=>({value:project.id, label:project.name})));
   const projectGuidance = projects.length
     ? 'Project paths stay on this machine and are resolved by its connector.'
-    : 'No local projects yet. On this machine run: python -m connector project add "C:/path/to/repo". Then refresh.';
+    : 'No local projects yet. On this machine run: deepbox project add "C:/path/to/repo". Then refresh.';
   const res=await showForm({
     title:'Add agent', desc:`Register an agent runtime on ${d.name}. ${projectGuidance}`,
     fields:[

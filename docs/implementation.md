@@ -106,13 +106,28 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
 
 用户在自己机器上自启的进程。**智能和 API key 都在这里，server 永远看不到。**
 
-### 3.0 P2 Cut 4：Supervisor / Transport 拆分
+### 3.0 本地命令与安装边界
+
+`scripts/install.ps1` / `install.sh` 只负责首次安装和显式升级：刷新
+`~/.deepbox/app`、维护独立 venv，并在 `~/.deepbox/bin` 安装一个稳定的 `deepbox`
+shim。installer 用 venv 内的 `deepbox-app.pth` 指向同级 `app`；shim 从调用者当前目录用
+venv Python 的 isolated mode（`-I -m connector.cli`）启动，因此不会从 caller cwd 或
+`PYTHONPATH` 注入同名 package。只有首个参数严格为 `upgrade` 时才重新下载 installer，
+普通 `deepbox connect` 绝不触碰 app 目录。
+
+`connector/cli.py` 是用户命令 dispatcher：`connect` 去掉命令名后转给
+`client.main(argv)`；`doctor` / `status` 转成原有 flag；`project` 保留子命令 argv。
+installer 仍写出旧 `deepbox-connect.cmd` / `.sh`，但它只委托 `deepbox connect`，从而兼容
+旧快捷方式而不再把安装与连接耦合。Windows installer 仅在安装/升级刷新前停止本 venv 的
+`-m connector` / `-m connector.cli` 进程树；连接路径不会调用该逻辑。
+
+### 3.0a P2 Cut 4：Supervisor / Transport 拆分
 connector 拆成两半，二者只经 IPC 抽象（`ipc.py`）通信：
 - **`supervisor.py`（sessiond）——会话所有权**：拥有全部 `PtySession` / `StructuredAgentSession` 生命周期；`detach()` 只断开 transport，绝不 kill PTY；显式 `terminate`、权威 `agents` 目录删除对应 agent 或 `shutdown()` 才结束 PTY。`agents` 帧必须是元素完整合法的列表才会原子替换目录（空列表是合法的 clear-all）；任一畸形元素使整帧保持 no-op。每次新 PTY 启动生成一个 UUID `pty_instance_id`，同一且仍存活的 local session 的幂等 `open` 复用该值；如果本地子进程已被外部终止但 reader 尚未完成清理，`open` 会剔除 stale handle 并启动新实例。旧 reader 的迟到 `exit` 以对象身份校验隔离，不能误删或关闭替代它的新 PTY。
 - **`transport.py`——WebSocket 传输**：不拥有 PTY。`TransportSession` 在 IPC 与 `/ws/devbox` 之间转发帧，心跳和网络重连都不能改变 PTY 生命周期。`run()` 同时监督四个子任务，任一完成即在 `finally` 取消并 `gather(..., return_exceptions=True)` 回收全部任务，再重抛首个非取消异常，避免 `_channel_to_ws()` 等后台异常变成 “Task exception was never retrieved”。
 - **IPC**：split 模式使用 Windows named pipe / POSIX `0600` Unix socket；消息为限制 1 MiB 的 newline-JSON，并有 HMAC 握手。all-in-one 模式使用相同 `Channel` 接口的 `LoopbackChannel`。
 
-### 3.0a P2 Cut 5：Protocol v3 durable spool、server ACK 与精确 resume
+### 3.0b P2 Cut 5：Protocol v3 durable spool、server ACK 与精确 resume
 
 Protocol v3 的输出身份是 `(session_id, pty_instance_id, seq)`：
 
@@ -417,7 +432,7 @@ model 或 reasoning 值。
   `busy_timeout` 和 `foreign_keys`；跨进程 mutation 用相邻 `.lock` 文件串行化。新目录/数据库分别尝试
   `0700`/`0600` 权限。`add()` 只接受已存在的目录、存为绝对路径，展开 `~` 但不展开路径中合法的环境变量语法；
   canonical path 重复添加会复用原 ID，显式名称只更新 metadata。
-- `python -m connector project add|remove|list|sync` 与常驻 connector 共用该 store。每次连接和 mutation 后，
+- `deepbox project add|remove|list|sync`（由 `connector.cli` 委托）与常驻 connector 共用该 store。每次连接和 mutation 后，
   `Connector.report_projects()` 向 `/api/devboxes/{id}/projects` 只发送 `public_projects()` 的
   `{id,name}`（以及 legacy migration 的 `{agent_id,local_project_id}`）；绝不发送 `path`。
 - Server 的 `DevboxProject` 只保存 path-free metadata。Agent 通过 `local_project_id` 外键引用 project，删除

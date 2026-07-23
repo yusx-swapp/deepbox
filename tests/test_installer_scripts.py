@@ -11,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install.ps1"
+INSTALLER_SH = ROOT / "scripts" / "install.sh"
 POWERSHELL = shutil.which("powershell.exe")
 
 
@@ -43,12 +44,45 @@ def test_windows_installer_stops_connector_before_replacing_source():
     assert "Command lines are inspected but never printed" in text
 
 
+def test_windows_installer_creates_stable_command_outside_app():
+    text = INSTALLER.read_text(encoding="utf-8")
+    command_body = text.split('$commandBody = @"', 1)[1].split('"@', 1)[0]
+
+    assert "$Command = Join-Path $Bin 'deepbox.cmd'" in text
+    assert 'if /I "%~1"=="upgrade" goto upgrade' in command_body
+    assert '-I -u -m connector.cli %*' in command_body
+    assert command_body.count("powershell.exe") == 1
+    assert "DEEPBOX_INSTALL_ONLY=1" in command_body
+    assert "PYTHONPATH" not in command_body
+    assert "Remove-DirectoryWithRetry" not in command_body
+    assert "deepbox-app.pth" in text
+    assert "Path(sys.prefix).parent / 'app'" in text
+    assert "Add-UserPathEntry -Path $Bin" in text
+
+
+def test_unix_installer_creates_stable_command_outside_app():
+    text = INSTALLER_SH.read_text(encoding="utf-8")
+    command_body = text.split("cat > \"$COMMAND\" <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+
+    assert 'COMMAND="${BIN}/deepbox"' in text
+    assert 'if [ "${1:-}" = "upgrade" ]; then' in command_body
+    assert '-I -u -m connector.cli "$@"' in command_body
+    assert command_body.count("curl -fsSL") == 1
+    assert "DEEPBOX_INSTALL_ONLY=1" in command_body
+    assert "PYTHONPATH" not in command_body
+    assert 'rm -rf "$SRC"' not in command_body
+    assert "deepbox-app.pth" in text
+    assert "Path(sys.prefix).parent / 'app'" in text
+    assert "deepbox command path" in text
+
+
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is unavailable")
 def test_connector_process_matcher_is_scoped_to_venv_and_module(tmp_path):
     target = r"C:\Users\Test User\.deepbox\venv\Scripts\python.exe"
     other = r"C:\Python312\python.exe"
     cases = [
         {"ExecutablePath": target, "CommandLine": f'"{target}" -u -m connector'},
+        {"ExecutablePath": target, "CommandLine": f'"{target}" -u -m connector.cli connect'},
         {"ExecutablePath": target, "CommandLine": f'"{target}" -m pip list'},
         {"ExecutablePath": other, "CommandLine": f'"{other}" -m connector'},
         {"ExecutablePath": None, "CommandLine": f'"{target}" -m connector --mode supervisor'},
@@ -67,6 +101,7 @@ def test_connector_process_matcher_is_scoped_to_venv_and_module(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.strip().splitlines()[-1]) == [
+        True,
         True,
         False,
         False,
