@@ -109,7 +109,13 @@ if [ ! -e "$COMMAND" ]; then
 #!/usr/bin/env bash
 # deepbox-stable-shim-v1
 set -euo pipefail
-ROOT="${DEEPBOX_HOME:-${HOME}/.deepbox}"
+if [ -n "${DEEPBOX_HOME:-}" ]; then
+  ROOT="$DEEPBOX_HOME"
+else
+  COMMAND_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  ROOT="$(CDPATH= cd -- "${COMMAND_DIR}/.." && pwd -P)"
+fi
+export DEEPBOX_HOME="$ROOT"
 if [ "${1:-}" = "upgrade" ]; then
   export DEEPBOX_INSTALL_ONLY=1
   URL="https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh"
@@ -141,7 +147,8 @@ cat > "$LAUNCHER" <<'EOF'
 #!/usr/bin/env bash
 # Legacy compatibility; prefer: deepbox connect
 set -euo pipefail
-ROOT="${DEEPBOX_HOME:-${HOME}/.deepbox}"
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export DEEPBOX_HOME="$ROOT"
 exec "${ROOT}/bin/deepbox" connect "$@"
 EOF
 chmod +x "$LAUNCHER"
@@ -157,15 +164,18 @@ case "$(basename "${SHELL:-sh}")" in
     ;;
   *) PROFILE="${HOME}/.profile" ;;
 esac
-PATH_MARKER='# deepbox command path'
+PATH_MARKER='# deepbox command path v2'
 if ! grep -Fq "$PATH_MARKER" "$PROFILE" 2>/dev/null; then
+  BIN_LITERAL="$("$PY" -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$BIN")"
   {
     printf '\n%s\n' "$PATH_MARKER"
+    printf '_DEEPBOX_BIN=%s\n' "$BIN_LITERAL"
     cat <<'EOF'
 case ":${PATH}:" in
-  *":${DEEPBOX_HOME:-${HOME}/.deepbox}/bin:"*) ;;
-  *) export PATH="${DEEPBOX_HOME:-${HOME}/.deepbox}/bin:${PATH}" ;;
+  *":${_DEEPBOX_BIN}:"*) ;;
+  *) export PATH="${_DEEPBOX_BIN}:${PATH}" ;;
 esac
+unset _DEEPBOX_BIN
 EOF
   } >> "$PROFILE"
 fi

@@ -53,6 +53,9 @@ def test_windows_installer_creates_stable_command_outside_app():
     assert '-I -u -m connector.cli %*' in command_body
     assert command_body.count("powershell.exe") == 1
     assert "DEEPBOX_INSTALL_ONLY=1" in command_body
+    assert 'if not defined DEEPBOX_ROOT for %%I in ("%~dp0..")' in command_body
+    assert 'set "DEEPBOX_HOME=%DEEPBOX_ROOT%"' in command_body
+    assert "%USERPROFILE%\\.deepbox" not in command_body
     assert "PYTHONPATH" not in command_body
     assert "Remove-DirectoryWithRetry" not in command_body
     assert "deepbox-app.pth" in text
@@ -69,6 +72,12 @@ def test_unix_installer_creates_stable_command_outside_app():
     assert '-I -u -m connector.cli "$@"' in command_body
     assert command_body.count("curl -fsSL") == 1
     assert "DEEPBOX_INSTALL_ONLY=1" in command_body
+    assert '${BASH_SOURCE[0]}' in command_body
+    assert 'export DEEPBOX_HOME="$ROOT"' in command_body
+    assert "_DEEPBOX_BIN" in text
+    assert "shlex.quote" in text
+    assert 'BIN_LITERAL="$("$PY" -c' in text
+    assert "$PYTHON" not in text
     assert "PYTHONPATH" not in command_body
     assert 'rm -rf "$SRC"' not in command_body
     assert "deepbox-app.pth" in text

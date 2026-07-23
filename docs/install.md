@@ -68,8 +68,10 @@ runs diagnostics and connects after setup. Otherwise it installs only and tells
 the user to run `deepbox connect`.
 
 Everything managed by the installer lives under `~/.deepbox`. Set
-`DEEPBOX_HOME` to use a different root, or `DEEPBOX_SOURCE_ZIP` to install from a
-fork or pinned branch.
+`DEEPBOX_HOME` while installing to use a different root. The stable command
+resolves that root from its own `bin` location when the variable is absent, and
+the Unix installer records the actual bin path in the selected login profile.
+`DEEPBOX_SOURCE_ZIP` installs from a fork or pinned branch.
 
 ## Reconnect and local commands
 

@@ -110,7 +110,8 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
 
 `scripts/install.ps1` / `install.sh` 只负责首次安装和显式升级：刷新
 `~/.deepbox/app`、维护独立 venv，并在 `~/.deepbox/bin` 安装一个稳定的 `deepbox`
-shim。installer 用 venv 内的 `deepbox-app.pth` 指向同级 `app`；shim 从调用者当前目录用
+shim。installer 用 venv 内的 `deepbox-app.pth` 指向同级 `app`；shim 默认从自身 `bin`
+位置解析安装根目录（因此自定义 `DEEPBOX_HOME` 不必在后续 shell 重复设置），再从调用者当前目录用
 venv Python 的 isolated mode（`-I -m connector.cli`）启动，因此不会从 caller cwd 或
 `PYTHONPATH` 注入同名 package。只有首个参数严格为 `upgrade` 时才重新下载 installer，
 普通 `deepbox connect` 绝不触碰 app 目录。

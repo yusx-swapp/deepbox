@@ -294,9 +294,11 @@ $commandBody = @"
 @echo off
 rem deepbox-stable-shim-v1
 setlocal
-if not defined DEEPBOX_HOME set "DEEPBOX_HOME=%USERPROFILE%\.deepbox"
+set "DEEPBOX_ROOT=%DEEPBOX_HOME%"
+if not defined DEEPBOX_ROOT for %%I in ("%~dp0..") do set "DEEPBOX_ROOT=%%~fI"
+set "DEEPBOX_HOME=%DEEPBOX_ROOT%"
 if /I "%~1"=="upgrade" goto upgrade
-set "DEEPBOX_PYTHON=%DEEPBOX_HOME%\venv\Scripts\python.exe"
+set "DEEPBOX_PYTHON=%DEEPBOX_ROOT%\venv\Scripts\python.exe"
 if not exist "%DEEPBOX_PYTHON%" (echo [deepbox] installation is incomplete; run deepbox upgrade & exit /b 1)
 "%DEEPBOX_PYTHON%" -I -u -m connector.cli %*
 exit /b %ERRORLEVEL%
@@ -317,8 +319,9 @@ $launcherBody = @"
 @echo off
 rem Legacy compatibility; prefer: deepbox connect
 setlocal
-if not defined DEEPBOX_HOME set "DEEPBOX_HOME=%USERPROFILE%\.deepbox"
-call "%DEEPBOX_HOME%\bin\deepbox.cmd" connect %*
+for %%I in ("%~dp0.") do set "DEEPBOX_ROOT=%%~fI"
+set "DEEPBOX_HOME=%DEEPBOX_ROOT%"
+call "%DEEPBOX_ROOT%\bin\deepbox.cmd" connect %*
 exit /b %ERRORLEVEL%
 "@
 Set-Content -Path $Launcher -Value $launcherBody -Encoding ASCII
