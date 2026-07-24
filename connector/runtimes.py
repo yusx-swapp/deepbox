@@ -29,6 +29,7 @@ Security invariants enforced here:
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -200,6 +201,10 @@ class RuntimeAdapter:
     default_surface: bool = False
     install_url: str | None = None
     install_command: str | None = None
+    # Adapter-declared Agent Skills destinations. Personal roots may use ``~``;
+    # project roots are relative to the registered LocalProject path.
+    personal_skill_roots: tuple[str, ...] = ()
+    project_skill_roots: tuple[str, ...] = ()
     auth_argv: tuple[str, ...] = ()
     version_argv: tuple[str, ...] = ("--version",)
     allow_custom_models: bool = True
@@ -238,6 +243,18 @@ class RuntimeAdapter:
     def surface_id(self) -> str:
         return self.surface or ("structured" if self.structured else "terminal")
 
+    def skill_roots(self, project_path: str | None = None) -> tuple[str, ...]:
+        """Resolve this adapter's declared skill roots on the connector host."""
+        if project_path is None:
+            return tuple(
+                os.path.abspath(os.path.expanduser(root))
+                for root in self.personal_skill_roots
+            )
+        return tuple(
+            os.path.abspath(os.path.join(project_path, root))
+            for root in self.project_skill_roots
+        )
+
     def capabilities(self, *, installed: bool, version: str | None = None,
                      path: str | None = None) -> dict:
         """Return an opaque JSON-serialisable capability blob for the server."""
@@ -262,6 +279,7 @@ class RuntimeAdapter:
                 "permission_modes": sorted(self.permission_modes),
                 "structured": self.structured,
                 "per_turn": self.per_turn,
+                "skills": bool(self.personal_skill_roots or self.project_skill_roots),
                 "controls": controls,
             },
         }
@@ -476,6 +494,11 @@ _REGISTRY["mock"] = RuntimeAdapter(
     version_argv=(), allow_custom_models=False,
 )
 
+_CLAUDE_PERSONAL_SKILL_ROOTS = ("~/.claude/skills", "~/.agents/skills")
+_CLAUDE_PROJECT_SKILL_ROOTS = (".claude/skills", ".agents/skills")
+_AGENT_PERSONAL_SKILL_ROOTS = ("~/.agents/skills",)
+_AGENT_PROJECT_SKILL_ROOTS = (".agents/skills",)
+
 register(RuntimeAdapter(
     id="claude-code",
     label="Claude Code",
@@ -492,6 +515,8 @@ register(RuntimeAdapter(
     },
     install_url="https://docs.anthropic.com/en/docs/claude-code/overview",
     install_command="npm install -g @anthropic-ai/claude-code",
+    personal_skill_roots=_CLAUDE_PERSONAL_SKILL_ROOTS,
+    project_skill_roots=_CLAUDE_PROJECT_SKILL_ROOTS,
     auth_argv=("auth", "status"),
 ))
 
@@ -509,6 +534,8 @@ register(RuntimeAdapter(
     },
     install_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
     install_command="npm install -g @github/copilot",
+    personal_skill_roots=_AGENT_PERSONAL_SKILL_ROOTS,
+    project_skill_roots=_AGENT_PROJECT_SKILL_ROOTS,
     # Copilot exposes interactive /login, not a reliable non-interactive
     # authentication-status command. Report "unknown" instead of blocking it.
     auth_argv=(),
@@ -529,6 +556,8 @@ register(RuntimeAdapter(
     },
     install_url="https://developers.openai.com/codex/cli/",
     install_command="npm install -g @openai/codex",
+    personal_skill_roots=_AGENT_PERSONAL_SKILL_ROOTS,
+    project_skill_roots=_AGENT_PROJECT_SKILL_ROOTS,
     auth_argv=("login", "status"),
 ))
 
@@ -572,6 +601,8 @@ register(RuntimeAdapter(
     ),
     install_url="https://docs.anthropic.com/en/docs/claude-code/overview",
     install_command="npm install -g @anthropic-ai/claude-code",
+    personal_skill_roots=_CLAUDE_PERSONAL_SKILL_ROOTS,
+    project_skill_roots=_CLAUDE_PROJECT_SKILL_ROOTS,
     auth_argv=("auth", "status"),
     permission_modes={
         # Default trusts this session (auto-accept edits) per product decision.
@@ -616,6 +647,8 @@ register(RuntimeAdapter(
     ),
     install_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
     install_command="npm install -g @github/copilot",
+    personal_skill_roots=_AGENT_PERSONAL_SKILL_ROOTS,
+    project_skill_roots=_AGENT_PROJECT_SKILL_ROOTS,
     # Authentication is interactive via /login; do not turn an unprobeable
     # status into a false-negative spawn gate.
     auth_argv=(),

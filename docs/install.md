@@ -85,18 +85,24 @@ deepbox project add <path> [--name <display-name>]
 deepbox project list
 deepbox project remove <project-id>
 deepbox project sync
+deepbox skill install <folder> [--project [ID|NAME|PATH]] [--force]
+deepbox skill list [--project [ID|NAME|PATH]]
+deepbox skill inspect <name> [--project [ID|NAME|PATH]]
+deepbox skill remove <name> [--project [ID|NAME|PATH]] [--force]
 ```
 
 The legacy `~/.deepbox/deepbox-connect.cmd` / `.sh` launcher delegates to
 `deepbox connect`, so existing shortcuts continue to work.
+
+## Local projects and skills
 
 ### Managing local projects
 
 Project paths live only in connector-local `state.db` under
 `%LOCALAPPDATA%\deepbox` on Windows or
 `${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The server and browser
-receive a stable project ID and display name, never the path. Register a project
-before selecting it while creating an agent in the browser:
+receive a stable project ID, display name, and non-secret runtime config, never
+the path. Register a project before selecting it while creating an agent:
 
 ```powershell
 deepbox project add "C:\src\my-repo" --name "my-repo"
@@ -113,10 +119,91 @@ deepbox project sync
 ```
 
 `add` requires an existing directory and stores its canonical absolute path;
-adding the same path again reuses its ID. `remove` deletes only the local
-registration, not the directory. After synchronization, server-side agents that
-referenced the removed project lose that binding. `sync` sends the path-free
-project list without starting the long-running connector.
+adding the same path again reuses its ID. `remove` deletes only the registration,
+not the directory. With a token, `add` and `remove` immediately report the path-free
+inventory; otherwise run `sync` later. A project with a managed project-scoped
+skill cannot be removed until that skill is removed.
+
+The browser's **Add agent** form refreshes projects at the point of use. Its
+**Add a local project** action only builds and copies a command such as
+`deepbox project add "C:\src\my-repo" --name "my-repo"`; it never browses or
+mutates the workstation. Run the command locally and then choose **Refresh projects**.
+
+### `SKILL.md` package schema
+
+A skill is a UTF-8 directory tree with a `SKILL.md` file at its root. The file
+starts with YAML frontmatter containing string `name` and `description` fields,
+followed by normal Markdown instructions:
+
+```markdown
+---
+name: review-pr
+description: Review a pull request for correctness, tests, and operational risk.
+---
+# Review a pull request
+
+Read the changed files before reporting findings.
+```
+
+The directory basename must exactly equal `name`. Names use lower-kebab-case,
+are at most 64 characters, and descriptions are at most 1,024 characters.
+Deepbox decodes `SKILL.md` strictly as UTF-8, parses frontmatter with
+`yaml.safe_load`, and requires a mapping with string keys. A package may contain
+at most 256 regular files and 10 MiB total. Symlinks, junctions, other reparse
+points, traversal, and files that change during hashing are rejected.
+Script-looking files and a `scripts/` directory are allowed but set
+`contains_scripts`; Deepbox itself never executes any skill content.
+
+### Install and manage skills
+
+Personal scope is the default. For project scope, provide `--project` with a
+registered ID, unique case-insensitive name, or exact normalized path. Supplying
+`--project` without a value is equivalent to `--project .` and selects the
+longest registered project containing the current working directory.
+
+```powershell
+# Personal scope
+deepbox skill install "C:\Skills\review-pr"
+deepbox skill list
+deepbox skill inspect review-pr
+deepbox skill remove review-pr
+
+# Project scope
+deepbox skill install "C:\Skills\review-pr" --project "my-repo"
+deepbox skill list --project "my-repo"
+deepbox skill inspect review-pr --project "my-repo"
+deepbox skill remove review-pr --project "my-repo"
+```
+
+Install validates and hashes the source twice, copies it to
+`<connector-state-root>/skills/store/<digest>/<name>/`, then stages replacements
+in every personal or project skill root declared by the registered runtime adapter
+families. The local database records scope, project, targets, and binding paths.
+Repeated root discovery merges with earlier bindings instead of orphaning them.
+`list` and `inspect` verify both the store and every binding and return
+`installed`, `drifted`, or `missing`. Install and remove refuse drifted
+destinations unless `--force` is explicit. Removing the final reference also
+garbage-collects the content-addressed store directory.
+
+While connected, the connector reports inventory changes automatically. The
+server stores only `id`, `name`, `description`, `digest`, `scope`, `project_id`,
+`targets`, `contains_scripts`, and `status`; it receives no source, store,
+project, or binding path and never reads model credentials.
+
+### Structured chat controls
+
+Opening **Add agent** refreshes runtime capabilities and projects before rendering
+its selectors. For an installed runtime, failed or empty live model discovery
+falls back to the adapter family's static models with `models.status=partial` and
+`models.source=adapter`. Structured chat always includes **Runtime default**.
+Adapters that set `allow_custom_models` receive an editable model combobox; other
+model and reasoning controls remain selects.
+
+Session-scoped controls are editable until the session is configured or contains
+its first chat item. They then lock with a prompt to start **New chat**. That action
+sends the structured `terminate` frame, creates a blank persisted session, and
+re-enables the controls without deleting saved history. The server forwards
+termination only for an operator who holds the keyboard lease.
 
 ## Upgrade explicitly
 

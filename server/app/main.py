@@ -7,6 +7,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import secrets
 import asyncio
 from pathlib import Path
@@ -1241,6 +1242,7 @@ def _devbox_json(d: Devbox) -> dict:
             "online": hub.is_devbox_online(d.id),
             "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             "capabilities": d.capabilities,
+            "skills": d.skills or [],
             "projects": [_project_json(p) for p in d.projects],
             "agents": [_agent_json(a) for a in d.agents]}
 
@@ -1686,10 +1688,84 @@ async def report_projects(devbox_id: str, request: Request,
     for project_id, project in existing.items():
         if project_id not in projects:
             s.delete(project)
+    if d.skills is not None:
+        d.skills = [
+            item for item in d.skills
+            if item.get("scope") == "personal"
+            or item.get("project_id") in projects
+        ]
     s.commit()
     await _push_agent_directory(d.id)
     return {"ok": True, "projects": len(projects),
             "migrations": len(migrations)}
+
+
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_TARGET_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _sanitized_skill_metadata(item: object, project_ids: set[str]) -> dict:
+    if not isinstance(item, dict):
+        raise HTTPException(422, "skill entries must be objects")
+    skill_id = item.get("id")
+    name = item.get("name")
+    description = item.get("description")
+    digest = item.get("digest")
+    scope = item.get("scope")
+    project_id = item.get("project_id")
+    targets = item.get("targets")
+    status = item.get("status")
+    contains_scripts = item.get("contains_scripts")
+    valid_digest = (isinstance(digest, str) and len(digest) == 64
+                    and all(ch in "0123456789abcdef" for ch in digest))
+    valid_targets = (isinstance(targets, list) and len(targets) <= 32
+                     and len(set(targets)) == len(targets)
+                     and all(isinstance(target, str) and len(target) <= 64
+                             and _SKILL_TARGET_RE.fullmatch(target)
+                             for target in targets))
+    if (not isinstance(skill_id, str) or not skill_id or len(skill_id) > 64
+            or not isinstance(name, str) or len(name) > 64
+            or not _SKILL_NAME_RE.fullmatch(name)
+            or not isinstance(description, str) or not description
+            or len(description) > 1024 or not valid_digest
+            or scope not in {"personal", "project"} or not valid_targets
+            or status not in {"installed", "drifted", "missing"}
+            or not isinstance(contains_scripts, bool)):
+        raise HTTPException(422, "invalid skill metadata")
+    if scope == "personal" and project_id is not None:
+        raise HTTPException(422, "personal skills cannot reference a project")
+    if scope == "project" and project_id not in project_ids:
+        raise HTTPException(422, "skill project is not registered on this devbox")
+    return {
+        "id": skill_id, "name": name, "description": description,
+        "digest": digest, "scope": scope, "project_id": project_id,
+        "targets": targets, "status": status,
+        "contains_scripts": contains_scripts,
+    }
+
+
+@app.post("/api/devboxes/{devbox_id}/skills")
+async def report_skills(devbox_id: str, request: Request,
+                        s: OrmSession = Depends(db)):
+    """Replace path-free connector skill metadata."""
+    d = devbox_from_bearer(request, s)
+    if d.id != devbox_id:
+        raise HTTPException(403, "wrong devbox")
+    body = await request.json()
+    raw_skills = body.get("skills", []) if isinstance(body, dict) else None
+    if not isinstance(raw_skills, list):
+        raise HTTPException(422, "skills must be an array")
+    if len(raw_skills) > 256:
+        raise HTTPException(422, "skill report is too large")
+    project_ids = {project.id for project in d.projects}
+    skills = [_sanitized_skill_metadata(item, project_ids) for item in raw_skills]
+    identities = {(item["scope"], item["project_id"], item["name"])
+                  for item in skills}
+    if len(identities) != len(skills):
+        raise HTTPException(422, "duplicate skill identity")
+    d.skills = skills
+    s.commit()
+    return {"ok": True, "skills": len(skills)}
 
 
 # ---------------------------------------------------------------- WS: devbox (connector)

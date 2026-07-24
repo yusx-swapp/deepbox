@@ -90,7 +90,7 @@ say "Installing connector dependencies ..."
 if [ -f "${SRC}/requirements-connector.txt" ]; then
   "$VENV_PY" -m pip install --quiet -r "${SRC}/requirements-connector.txt"
 else
-  "$VENV_PY" -m pip install --quiet 'httpx>=0.27' 'websockets>=12.0'
+  "$VENV_PY" -m pip install --quiet 'httpx>=0.27' 'websockets>=12.0' 'PyYAML>=6.0'
 fi
 SITE_PACKAGES="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])')"
 if [ -z "$SITE_PACKAGES" ]; then

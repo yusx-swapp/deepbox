@@ -63,6 +63,11 @@ def test_windows_installer_creates_stable_command_outside_app():
     assert "Add-UserPathEntry -Path $Bin" in text
 
 
+def test_fallback_connector_dependencies_include_skill_frontmatter_parser():
+    assert "'PyYAML>=6.0'" in INSTALLER.read_text(encoding="utf-8")
+    assert "'PyYAML>=6.0'" in INSTALLER_SH.read_text(encoding="utf-8")
+
+
 def test_unix_installer_creates_stable_command_outside_app():
     text = INSTALLER_SH.read_text(encoding="utf-8")
     command_body = text.split("cat > \"$COMMAND\" <<'EOF'", 1)[1].split("\nEOF", 1)[0]

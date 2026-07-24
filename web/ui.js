@@ -32,6 +32,48 @@
     return value || 'runtime';
   }
 
+  // Capability reports started as a bare runtime array. Newer connectors wrap
+  // that array so sanitized local inventories can travel beside it while the
+  // server continues treating the payload as opaque JSON.
+  function runtimeCapabilities(report){
+    if(Array.isArray(report)) return report;
+    return Array.isArray(report?.runtimes) ? report.runtimes : [];
+  }
+
+  function skillInventory(report){
+    const items = Array.isArray(report?.skills) ? report.skills : [];
+    return items.filter(item=>item && item.name).map(item=>({
+      name:String(item.name),
+      description:String(item.description || ''),
+      digest:String(item.digest || ''),
+      scope:item.scope === 'project' ? 'project' : 'personal',
+      project_id:item.project_id ? String(item.project_id) : null,
+      targets:Array.isArray(item.targets) ? item.targets.map(String) : [],
+      status:['installed', 'drifted', 'missing'].includes(item.status)
+        ? item.status : 'unknown',
+      contains_scripts:item.contains_scripts === true,
+    }));
+  }
+
+  function _commandValue(value, fallback){
+    const text = String(value == null ? '' : value).trim() || fallback;
+    return `"${text.replace(/"/g, '\\"')}"`;
+  }
+
+  function projectAddCommand(path, name){
+    return `deepbox project add ${_commandValue(path, '<local-folder>')} --name ${_commandValue(name, '<project-name>')}`;
+  }
+
+  function skillInstallCommand(path, project){
+    const base = `deepbox skill install ${_commandValue(path, '<skill-folder>')}`;
+    return project ? `${base} --project ${_commandValue(project, '<project>')}` : base;
+  }
+
+  function skillRemoveCommand(name, project){
+    const base = `deepbox skill remove ${_commandValue(name, '<skill-name>')}`;
+    return project ? `${base} --project ${_commandValue(project, '<project>')}` : base;
+  }
+
   function isCapabilityV2(capability){
     return !!(capability && Number(capability.schema_version) >= 2
       && Array.isArray(capability.surfaces));
@@ -420,6 +462,11 @@
     escapeHtml: escapeHtml,
     initials: initials,
     runtimeLabel: runtimeLabel,
+    runtimeCapabilities: runtimeCapabilities,
+    skillInventory: skillInventory,
+    projectAddCommand: projectAddCommand,
+    skillInstallCommand: skillInstallCommand,
+    skillRemoveCommand: skillRemoveCommand,
     isCapabilityV2: isCapabilityV2,
     findRuntimeCapability: findRuntimeCapability,
     runtimeOptions: runtimeOptions,

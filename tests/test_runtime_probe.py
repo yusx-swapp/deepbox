@@ -85,6 +85,7 @@ def test_probe_missing_runtime_is_reported_without_host_paths(monkeypatch):
         "permission_modes": [],
         "structured": True,
         "per_turn": False,
+        "skills": False,
         "controls": [{
             "key": "model",
             "label": "Model",
@@ -155,6 +156,28 @@ def test_probe_falls_back_to_partial_adapter_models(monkeypatch):
     assert capability["models"]["items"] == [
         {"id": "fallback-model", "label": "fallback-model"},
     ]
+
+
+def test_phase_a_probe_keeps_static_models_until_discovery_runs(monkeypatch):
+    adapter = _adapter(probe_hint=lambda: True, auth_argv=())
+    monkeypatch.setattr(runtimes, "all_adapters", lambda: [adapter])
+
+    capability = probe_family(
+        "test-cli",
+        include_models=False,
+        runner=lambda argv, timeout: ProbeResult(0, "v1"),
+    )
+
+    assert capability["models"]["status"] == "partial"
+    assert capability["models"]["source"] == "adapter"
+    assert capability["models"]["items"] == [
+        {"id": "fallback-model", "label": "fallback-model"},
+    ]
+    model_control = next(
+        item for item in capability["surfaces"][0]["features"]["controls"]
+        if item["key"] == "model"
+    )
+    assert model_control["choices"] == ["fallback-model"]
 
 
 def test_runtime_probe_cache_is_scoped_by_devbox_and_ttl(monkeypatch):

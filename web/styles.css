@@ -298,6 +298,7 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
 .box-empty{padding:10px 11px;color:var(--fg-faint);font-size:12px}
 .box-foot{display:flex;gap:6px;padding:8px 11px;border-top:1px solid var(--border-faint)}
 .box-foot button{padding:4px 9px;font-size:11px}
+.button-count{font-family:var(--font-mono);color:var(--fg-faint);margin-left:3px}
 .fleet-empty{padding:26px 16px;text-align:center;color:var(--fg-muted)}
 .fleet-empty h4{color:var(--fg);margin-bottom:6px}
 
@@ -362,6 +363,24 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
 .token-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;color:var(--fg-muted);font-size:12px}
 .token-head:first-child{margin-top:0}
 .token-command{color:var(--fg-muted);word-break:normal;overflow-wrap:anywhere}
+.skill-list{display:grid;gap:8px;margin-bottom:16px}
+.skill-row{padding:11px 12px;border:1px solid var(--border);border-radius:8px;background:var(--panel-2)}
+.skill-row-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.skill-row-head b{font-size:13px;font-weight:600}
+.skill-scope{display:block;margin-top:2px;color:var(--fg-faint);font-size:11px}
+.skill-row p{margin:8px 0;color:var(--fg-muted);font-size:12px;line-height:1.5}
+.skill-meta{display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:9px;color:var(--fg-faint);font-family:var(--font-mono);font-size:10px}
+.skill-status{padding:2px 6px;border:1px solid var(--border);border-radius:999px;color:var(--fg-muted);font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+.skill-status-installed{border-color:color-mix(in srgb,var(--ok) 35%,var(--border));color:var(--ok)}
+.skill-status-drifted,.skill-status-missing{border-color:color-mix(in srgb,var(--busy) 40%,var(--border));color:var(--busy)}
+.empty-inline{padding:18px;border:1px dashed var(--border);border-radius:8px;color:var(--fg-faint);font-size:12px;text-align:center}
+.local-action-guide{margin-top:14px;padding:11px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--panel-2)}
+.local-action-guide summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--fg)}
+.local-action-guide p{margin:9px 0;color:var(--fg-muted);font-size:12px}
+.local-command-fields{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.local-command-fields label{display:grid;gap:4px;color:var(--fg-muted);font-size:11px}
+.local-command-fields input{min-width:0}
+.local-action-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:9px;color:var(--fg-faint)}
 
 /* ---- replay bar -------------------------------------------------------- */
 
@@ -476,6 +495,8 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
 .chat-turn{align-self:center;font-size:11px;opacity:.5;padding:2px 8px}
 .chat-composer{border-top:1px solid var(--border);background:var(--panel);padding:10px 12px 12px}
 .chat-controls{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px;margin-bottom:9px}
+.chat-session-note{align-self:center;color:var(--fg-faint);font-size:11px}
+.chat-new{margin-left:auto}
 .chat-control{display:flex;flex-direction:column;gap:3px;color:var(--fg-muted);font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
 .chat-control select,.chat-control input{min-width:118px;padding:5px 26px 5px 8px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);background-color:var(--well);color:var(--fg);font:12px var(--sans);text-transform:none;letter-spacing:0}
 .chat-control select:disabled,.chat-control input:disabled{cursor:not-allowed;opacity:.58}

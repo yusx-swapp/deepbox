@@ -171,11 +171,6 @@ def probe_family(
         if model_ids:
             model_status = "partial"
             model_source = "adapter"
-    if not include_models:
-        model_ids = []
-        model_status = "unknown"
-        model_source = "not_probed"
-
     available = installed and compatibility["status"] != "incompatible"
     surfaces = [_surface_json(adapter, available) for adapter in adapters]
     for adapter, surface_item in zip(adapters, surfaces):

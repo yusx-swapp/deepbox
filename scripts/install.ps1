@@ -278,7 +278,7 @@ $req = Join-Path $Src 'requirements-connector.txt'
 if (Test-Path $req) {
     & $VenvPy -m pip install --quiet -r $req
 } else {
-    & $VenvPy -m pip install --quiet 'httpx>=0.27' 'websockets>=12.0' 'pywinpty>=2.0'
+    & $VenvPy -m pip install --quiet 'httpx>=0.27' 'websockets>=12.0' 'PyYAML>=6.0' 'pywinpty>=2.0'
 }
 $sitePackages = (& $VenvPy -c "import site; print(site.getsitepackages()[0])").Trim()
 if (-not $sitePackages) { throw "Could not locate the connector virtualenv site-packages directory." }

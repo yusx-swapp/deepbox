@@ -16,6 +16,7 @@ Commands:
   doctor     Check server reachability and connector credentials
   status     Show local connector status
   project    Manage connector-local project paths
+  skill      Install and manage connector-local Agent Skills
   upgrade    Refresh the installed connector explicitly
 
 Run 'deepbox <command> --help' for connector command options.
@@ -45,7 +46,7 @@ def connector_argv(argv: Sequence[str]) -> list[str] | None:
         return ["--doctor", *rest]
     if command == "status":
         return ["--status", *rest]
-    if command == "project":
+    if command in {"project", "skill"}:
         return args
     if command == "upgrade":
         raise CommandError(

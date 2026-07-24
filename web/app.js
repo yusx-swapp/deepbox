@@ -368,6 +368,7 @@ function renderFleet() {
       <div class="box-foot">
         ${canAdmin?`<button class="ghost" data-agent="${esc(d.id)}">+ Agent</button>`:''}
         <button class="ghost" data-runtimes="${esc(d.id)}">Runtimes</button>
+        <button class="ghost" data-skills="${esc(d.id)}">Skills <span class="button-count">${Array.isArray(d.skills) ? d.skills.length : 0}</span></button>
         <span class="spacer"></span>
         ${canAdmin?`<button class="ghost" data-token="${esc(d.id)}">Rotate token</button>
         <button class="danger" data-del="${esc(d.id)}">Delete</button>`:''}
@@ -420,6 +421,7 @@ function renderFleet() {
 
   fleet.querySelectorAll('[data-agent]').forEach(b=>b.onclick=()=>createAgent(b.dataset.agent));
   fleet.querySelectorAll('[data-runtimes]').forEach(b=>b.onclick=()=>showRuntimeSetup(b.dataset.runtimes));
+  fleet.querySelectorAll('[data-skills]').forEach(b=>b.onclick=()=>showSkills(b.dataset.skills));
   fleet.querySelectorAll('[data-open]').forEach(b=>b.onclick=(e)=>{
     if(e.target.closest('[data-hist],[data-agent-del],[data-open-terminal]')) return;
     openAgent(b.dataset.open, b.dataset.name);
@@ -774,10 +776,60 @@ async function delDevbox(id){
   await api(`/api/devboxes/${id}`,{method:'DELETE'});
   if (await loadDevboxes()) renderFleet();
 }
+function bindCommandCopies(root){
+  root.querySelectorAll('[data-copy-command]').forEach(button=>{
+    button.onclick=async()=>{
+      const label=button.textContent;
+      try{
+        await copyText(button.dataset.copyCommand || '');
+        button.textContent='Copied';
+      }catch(_){
+        button.textContent='Copy failed';
+      }
+      setTimeout(()=>{ if(button.isConnected) button.textContent=label; }, 1600);
+    };
+  });
+}
+
+async function showSkills(devboxId){
+  await loadDevboxes();
+  const devbox=devboxes.find(item=>item.id===devboxId);
+  if(!devbox) return;
+  const projects=new Map((devbox.projects || []).map(project=>[project.id, project.name]));
+  const skills=Array.isArray(devbox.skills) ? devbox.skills : [];
+  const rows=skills.length ? skills.map(skill=>{
+    const scope=skill.scope === 'project'
+      ? `Project \u00b7 ${projects.get(skill.project_id) || 'Unavailable project'}`
+      : 'Personal';
+    const targets=(skill.targets || []).join(', ') || 'No runtime target';
+    const status=skill.status || 'missing';
+    const inspectCommand=`deepbox skill inspect "${String(skill.name).replaceAll('"', '\\"')}"${skill.scope === 'project' && skill.project_id ? ` --project "${String(projects.get(skill.project_id) || skill.project_id).replaceAll('"', '\\"')}"` : ''}`;
+    return `<div class="skill-row">
+      <div class="skill-row-head"><div><b>${esc(skill.name)}</b><span class="skill-scope">${esc(scope)}</span></div><span class="skill-status skill-status-${esc(status)}">${esc(status)}</span></div>
+      <p>${esc(skill.description)}</p>
+      <div class="skill-meta"><span>${esc(targets)}</span>${skill.contains_scripts ? '<span>Contains scripts (not executed by Deepbox)</span>' : ''}</div>
+      <button class="ghost compact" type="button" data-copy-command="${esc(inspectCommand)}">Copy inspect command</button>
+    </div>`;
+  }).join('') : '<div class="empty-inline">No skills reported by this connector yet.</div>';
+  const installCommand='deepbox skill install "<skill-folder>"';
+  const listCommand='deepbox skill list';
+  await showModal({
+    title:`Skills on ${devbox.name}`,
+    desc:'Skills are installed by your local connector into runtime-discovered directories. Deepbox stores only path-free metadata on the server and never executes files from a skill package.',
+    bodyHtml:`<div class="skill-list">${rows}</div>
+      <div class="token-head"><b>Install a personal skill on this machine</b><button class="ghost compact" type="button" data-copy-command="${esc(installCommand)}">Copy command</button></div>
+      <div class="token token-command">${esc(installCommand)}</div>
+      <div class="token-head"><b>List local skills</b><button class="ghost compact" type="button" data-copy-command="${esc(listCommand)}">Copy command</button></div>
+      <div class="token token-command">${esc(listCommand)}</div>`,
+    actions:[{label:'Close', primary:true, value:true}],
+    onReady:bindCommandCopies,
+  });
+}
+
 function showRuntimeSetup(devboxId){
   const devbox = devboxes.find(item=>item.id === devboxId);
   if(!devbox) return;
-  const inventory = ui.runtimeInventory(devbox.capabilities);
+  const inventory = ui.runtimeInventory(ui.runtimeCapabilities(devbox.capabilities));
   const bodyHtml = inventory.length ? inventory.map(item=>{
     const state = item.installation === 'installed'
       ? `${item.compatibility} · ${item.authentication}` : 'not installed';
@@ -799,27 +851,75 @@ function showRuntimeSetup(devboxId){
 }
 
 async function createAgent(devboxId){
-  const d=devboxes.find(x=>x.id===devboxId);
+  // Runtime probing and local-project reporting are asynchronous. Refresh at
+  // the point of use instead of trusting the fleet snapshot loaded at boot.
+  await loadDevboxes();
+  let d=devboxes.find(x=>x.id===devboxId);
   if(!d) return;
-  const runtimes = ui.runtimeOptions(d.capabilities);
+  const runtimes = ui.runtimeOptions(ui.runtimeCapabilities(d.capabilities));
   if(!runtimes.length){
     await showAlert('No runtimes reported',
       'Start or reconnect this machine so the connector can report its available runtime adapters.');
     return;
   }
-  const projects = ui.localProjectOptions(d.projects);
-  const projectOptions = [{value:'', label:'No project (runtime default)'}]
-    .concat(projects.map(project=>({value:project.id, label:project.name})));
-  const projectGuidance = projects.length
-    ? 'Project paths stay on this machine and are resolved by its connector.'
-    : 'No local projects yet. On this machine run: deepbox project add "C:/path/to/repo". Then refresh.';
+  const projectOptions = ()=>[{value:'', label:'No project (runtime default)'}]
+    .concat(ui.localProjectOptions(d.projects).map(project=>({value:project.id, label:project.name})));
+  const projectGuide = `<details class="local-action-guide">
+    <summary>Add a local project</summary>
+    <p>Run this on <b>${esc(d.name)}</b>. The folder path stays on that machine.</p>
+    <div class="local-command-fields">
+      <label>Folder path<input id="project-local-path" placeholder="C:\\path\\to\\project"></label>
+      <label>Display name<input id="project-local-name" placeholder="My project"></label>
+    </div>
+    <div class="token-head"><b>Command</b><button class="ghost compact" type="button" id="copy-project-add">Copy command</button></div>
+    <div class="token token-command" id="project-add-command"></div>
+    <div class="local-action-footer"><small>After it succeeds, refresh this list. No restart is needed.</small><button class="ghost compact" type="button" id="refresh-projects">Refresh projects</button></div>
+  </details>`;
   const res=await showForm({
-    title:'Add agent', desc:`Register an agent runtime on ${d.name}. ${projectGuidance}`,
+    title:'Add agent', desc:`Register an agent runtime on ${d.name}.`,
     fields:[
       {name:'handle', label:'Handle', placeholder:'e.g. claude', required:true},
       {name:'runtime', label:'Runtime adapter', type:'select', options:runtimes, required:true},
-      {name:'local_project_id', label:'Local project', type:'select', options:projectOptions},
-    ], submit:'Add agent'});
+      {name:'local_project_id', label:'Local project', type:'select', options:projectOptions(),
+        helpHtml:'<small>Projects are connector-local. Add one below, then refresh.</small>'},
+    ],
+    extraHtml:projectGuide,
+    onReady:(overlay)=>{
+      const pathInput=overlay.querySelector('#project-local-path');
+      const nameInput=overlay.querySelector('#project-local-name');
+      const command=overlay.querySelector('#project-add-command');
+      const copy=overlay.querySelector('#copy-project-add');
+      const update=()=>{ command.textContent=ui.projectAddCommand(pathInput.value, nameInput.value); };
+      pathInput.oninput=update;
+      nameInput.oninput=update;
+      update();
+      copy.onclick=async()=>{
+        const original=copy.textContent;
+        try { await copyText(command.textContent); copy.textContent='Copied'; }
+        catch(e) { copy.textContent='Copy failed'; }
+        setTimeout(()=>{ if(copy.isConnected) copy.textContent=original; }, 1400);
+      };
+      overlay.querySelector('#refresh-projects').onclick=async event=>{
+        const button=event.currentTarget;
+        button.disabled=true;
+        button.textContent='Refreshing...';
+        try {
+          await loadDevboxes();
+          d=devboxes.find(x=>x.id===devboxId) || d;
+          const select=overlay.querySelector('[data-field="local_project_id"]');
+          const selected=select.value;
+          const options=projectOptions();
+          select.innerHTML=options.map(option=>`<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
+          if(options.some(option=>option.value===selected)) select.value=selected;
+          button.textContent='Refreshed';
+        } catch(e) {
+          button.textContent='Refresh failed';
+        } finally {
+          setTimeout(()=>{ if(button.isConnected){ button.disabled=false; button.textContent='Refresh projects'; } }, 1200);
+        }
+      };
+    },
+    submit:'Add agent'});
   if(!res)return;
   try{
     await api(`/api/devboxes/${devboxId}/agents`,{method:'POST',
@@ -921,7 +1021,7 @@ function currentAgentCapability(){
   for(const devbox of devboxes){
     const agent = (devbox.agents || []).find(item => item.id === curAgentId);
     if(!agent) continue;
-    const capability = ui.findRuntimeCapability(devbox.capabilities, agent.runtime);
+    const capability = ui.findRuntimeCapability(ui.runtimeCapabilities(devbox.capabilities), agent.runtime);
     return ui.capabilityForSurface(capability, currentSurface);
   }
   return null;
@@ -965,8 +1065,10 @@ function syncChatControls(){
     select.value = typeof selected === 'string' &&
       (control.choices.includes(selected) || validCustom) ? selected : '';
     select.disabled = control.scope === 'session' && sessionLocked;
-    select.title = select.disabled ? 'Fixed for this live session' : '';
+    select.title = select.disabled ? 'Fixed for this chat. Start a New chat to change it.' : '';
   }
+  const note = document.getElementById('chat-session-note');
+  if(note) note.hidden = !(sessionLocked && chatControls.some(control=>control.scope === 'session'));
 }
 
 function renderAttachmentTray(){
@@ -1038,7 +1140,7 @@ function setupChatControls(){
       if(control.allow_custom){
         select = document.createElement('input');
         select.setAttribute('list', `chat-choices-${control.key}`);
-        select.placeholder = 'Default or model ID';
+        select.placeholder = control.key === 'model' ? 'Runtime default or model ID' : 'Runtime default';
         const datalist = document.createElement('datalist');
         datalist.id = `chat-choices-${control.key}`;
         for(const choice of control.choices){
@@ -1051,7 +1153,7 @@ function setupChatControls(){
         select = document.createElement('select');
         const fallback = document.createElement('option');
         fallback.value = '';
-        fallback.textContent = 'Default';
+        fallback.textContent = 'Runtime default';
         select.appendChild(fallback);
         for(const choice of control.choices){
           const option = document.createElement('option');
@@ -1082,6 +1184,14 @@ function setupChatControls(){
       button.onclick = ()=>input.click();
       toolbar.append(button, input);
     }
+  }
+  if(chatControls.some(control=>control.scope === 'session')){
+    const note = document.createElement('span');
+    note.id = 'chat-session-note';
+    note.className = 'chat-session-note';
+    note.textContent = 'Fixed for this chat · New chat to change';
+    note.hidden = true;
+    toolbar.appendChild(note);
   }
   toolbar.hidden = !chatControls.length;
   syncChatControls();
@@ -1116,6 +1226,18 @@ async function enterChatMode(){
        </div>
      </div>`;
     setupChatControls();
+    const head = document.getElementById('termhead');
+    if(head && !document.getElementById('chat-new')){
+      const button = document.createElement('button');
+      button.id = 'chat-new';
+      button.type = 'button';
+      button.className = 'ghost compact chat-new';
+      button.textContent = 'New chat';
+      button.title = 'Start a fresh session to change model or reasoning';
+      button.onclick = ()=>void startNewChat(button);
+      const collab = document.getElementById('collab');
+      head.insertBefore(button, collab || null);
+    }
     const form = document.getElementById('chat-form');
     const input = document.getElementById('chat-input');
     form.onsubmit = (e)=>{ e.preventDefault(); void sendChatMessage(); };
@@ -1189,8 +1311,37 @@ function handleChatFrame(f){
 }
 
 
-async function openAgent(agentId, name, surfaceOverride=null){
+async function startNewChat(button){
+  if(!curAgentId || !curSession) return;
+  const found = findAgent(curAgentId);
+  if(!found) return;
+  const agent = found.agent;
+  const hasConversation = !!(chatState && (chatState.configured || chatState.items.length));
+  if(hasConversation){
+    const confirmed = await showConfirm(
+      'Start a new chat?',
+      'This ends the current runtime session and starts a blank chat. Saved history remains available.',
+      'New chat');
+    if(!confirmed) return;
+  }
+  const oldLabel = button?.textContent;
+  if(button){ button.disabled = true; button.textContent = 'Starting...'; }
+  try{
+    if(termInputSender) termInputSender.flush();
+    if(termWS && termWS.readyState===1){
+      termWS.send(JSON.stringify({type:'terminate', session_id:curSession}));
+    }
+    await openAgent(curAgentId, agent.display_name || agent.handle, 'structured', true);
+  }catch(error){
+    await showAlert('New chat could not start', error.message || 'The request failed.');
+  }finally{
+    if(button?.isConnected){ button.disabled = false; button.textContent = oldLabel || 'New chat'; }
+  }
+}
+
+async function openAgent(agentId, name, surfaceOverride=null, forceNew=false){
   await loadCollaborationHelpers();
+  await loadDevboxes();
   // Switching sessions: reset collaboration state so a stale lease/holder from
   // the previous terminal never leaks input rights into the new one.
   collabState = null;
@@ -1199,7 +1350,8 @@ async function openAgent(agentId, name, surfaceOverride=null){
   const activeDevbox = devboxes.find(devbox =>
     (devbox.agents || []).some(agent => agent.id === agentId));
   const activeAgent = (activeDevbox?.agents || []).find(agent => agent.id === agentId);
-  const familyCapability = ui.findRuntimeCapability(activeDevbox?.capabilities, activeAgent?.runtime);
+  const familyCapability = ui.findRuntimeCapability(
+    ui.runtimeCapabilities(activeDevbox?.capabilities), activeAgent?.runtime);
   currentSurface = surfaceOverride || ui.preferredSurface(familyCapability);
   const structuredCapability = currentAgentCapability();
   const expectsStructured = ui.supportsStructuredChat(structuredCapability);
@@ -1230,8 +1382,8 @@ async function openAgent(agentId, name, surfaceOverride=null){
   focusTerminal(true);
   // Resume the newest PTY that is still alive on the devbox. Previously every
   // click silently created a new session, making persisted history invisible.
-  const sessions = await api(`/api/agents/${agentId}/sessions`);
-  let sess = sessions.find(s => s.state === 'live');
+  const sessions = forceNew ? [] : await api(`/api/agents/${agentId}/sessions`);
+  let sess = forceNew ? null : sessions.find(s => s.state === 'live');
   const resumed = !!sess;
   if(!sess) sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
   curSession = sess.id;
@@ -1783,7 +1935,7 @@ function showConfirm(title, message, confirmLabel){
 }
 
 // Form modal. Returns {field:value,...} on submit, or null on cancel.
-function showForm({title, desc, fields, submit}){
+function showForm({title, desc, fields, submit, extraHtml='', onReady=null}){
   return new Promise(resolve=>{
     closeOverlay();
     const overlay = document.createElement('div');
@@ -1791,17 +1943,17 @@ function showForm({title, desc, fields, submit}){
     const fieldHtml = fields.map((f,i)=>{
       const id = 'f_'+i;
       const control = f.type==='select'
-        ? `<select id="${id}">${f.options.map(option=>{
+        ? `<select id="${id}" data-field="${esc(f.name)}">${f.options.map(option=>{
             const value = typeof option==='object' ? option.value : option;
             const label = typeof option==='object' ? option.label : option;
             return `<option value="${esc(value)}"${value===f.value?' selected':''}>${esc(label)}</option>`;
           }).join('')}</select>`
-        : `<input id="${id}" placeholder="${esc(f.placeholder||'')}" value="${esc(f.value||'')}"/>`;
-      return `<div class="field"><label for="${id}">${esc(f.label)}</label>${control}</div>`;
+        : `<input id="${id}" data-field="${esc(f.name)}" type="${esc(f.type||'text')}" placeholder="${esc(f.placeholder||'')}" value="${esc(f.value||'')}"/>`;
+      return `<div class="field"><label for="${id}">${esc(f.label)}</label>${control}${f.helpHtml||''}</div>`;
     }).join('');
     overlay.innerHTML = `<div class="modal" role="dialog" aria-label="${esc(title||'')}">
       <div class="modal-head"><h3>${esc(title||'')}</h3>${desc?`<p>${esc(desc)}</p>`:''}</div>
-      <div class="modal-body">${fieldHtml}</div>
+      <div class="modal-body">${fieldHtml}${extraHtml}</div>
       <div class="modal-err" id="form-err"></div>
       <div class="modal-actions">
         <button class="ghost" data-cancel>Cancel</button>
@@ -1825,6 +1977,7 @@ function showForm({title, desc, fields, submit}){
     document.body.appendChild(overlay);
     overlay.querySelector('[data-cancel]').onclick = ()=> done(null);
     overlay.querySelector('[data-submit]').onclick = submitForm;
+    if(onReady) onReady(overlay);
     const first = overlay.querySelector('input,select'); if(first) first.focus();
   });
 }

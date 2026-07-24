@@ -52,6 +52,36 @@ test('localProjectOptions keeps path-free ids and names only', () => {
   assert.deepEqual(ui.localProjectOptions(null), []);
 });
 
+test('capability report helpers preserve legacy arrays and sanitize skills', () => {
+  const runtimes = [{runtime:'claude-code'}];
+  assert.equal(ui.runtimeCapabilities(runtimes), runtimes);
+  assert.deepEqual(ui.runtimeCapabilities({runtimes}), runtimes);
+  assert.deepEqual(ui.runtimeCapabilities(null), []);
+  assert.deepEqual(ui.skillInventory({skills:[{
+    name:'review-code', description:'Review changes', digest:'abc', scope:'project',
+    project_id:'p1', targets:['claude-code'], status:'drifted', contains_scripts:true,
+    source_path:'C:\\secret', bindings:['C:\\secret'],
+  }]}), [{
+    name:'review-code', description:'Review changes', digest:'abc', scope:'project',
+    project_id:'p1', targets:['claude-code'], status:'drifted', contains_scripts:true,
+  }]);
+});
+
+test('local setup command helpers are copyable and keep paths browser-local', () => {
+  assert.equal(
+    ui.projectAddCommand('C:\\Code\\deepbox', 'Deepbox'),
+    'deepbox project add "C:\\Code\\deepbox" --name "Deepbox"'
+  );
+  assert.equal(
+    ui.skillInstallCommand('C:\\skills\\review-code', 'Deepbox'),
+    'deepbox skill install "C:\\skills\\review-code" --project "Deepbox"'
+  );
+  assert.equal(
+    ui.skillRemoveCommand('review-code'),
+    'deepbox skill remove "review-code"'
+  );
+});
+
 test('agentApiPath safely addresses opaque agent IDs', () => {
   assert.equal(ui.agentApiPath('agent/with spaces'),
     '/api/agents/agent%2Fwith%20spaces');

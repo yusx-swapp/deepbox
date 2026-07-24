@@ -37,15 +37,15 @@ canonical event。智能（Claude/Copilot/Codex）100% 跑在用户机器上。
 
 ### 2.1 `models.py`：持久化数据模型
 
-SQLAlchemy Core 模型覆盖用户、内部 organization、workspace/membership、workspace invitation、Devbox、Agent、Session、参与者、PTY 输出、DVR recording、结构化消息、任务与 LocalProject。
+SQLAlchemy Core 模型覆盖用户、内部 organization、workspace/membership、workspace invitation、Devbox、Agent、Session、参与者、PTY/DVR recording、结构化消息、任务与 path-free LocalProject metadata。Skill 内容只存在 connector，Server 不建 Skill 内容表。
 
 - `User` 保留本地 `password_hash`，并增加 `email / auth_provider / external_tenant_id / external_subject / disabled_at`。部分唯一索引 `uq_user_external_identity` 只约束非空 Microsoft 外部身份三元组。
 - `Workspace` 是用户可见的协作边界；`Membership` 对 `(workspace_id, user_id)` 唯一并保存 `viewer / operator / admin / owner`。`Devbox.workspace_id` 与 `Session.workspace_id` 把所有资源归到 workspace。
 - `WorkspaceInvitation` 保存标准化邮箱、目标角色、SHA-256 token hash、短 preview、过期/接受/撤销时间与接受者；服务端不持久化明文邀请 token。
 - `Invitation` 仍用于 deployment owner 创建本地密码账号；它与 workspace access 分离。
-- `runtime_capabilities_json` 对 server 是 opaque JSON blob；LocalProject 保存 `path / label / is_default / capability_flags`，其中 `capability_flags` 也保持 opaque。
+- `Devbox.capabilities` 对 Server 是 opaque runtime JSON；`Devbox.skills` 只保存 sanitized JSON inventory。`DevboxProject(id, devbox_id, name, runtime_config, created_at, updated_at)` 不含 path；`Agent.local_project_id` 以 `SET NULL` FK 引用它，legacy `cwd/launch_cmd` 只保留一个 migration cycle。
 - `_migrate()` 以 append-only `ALTER TABLE` 补列，并单独创建 SQLite 无法通过 ALTER 添加的唯一索引；`_backfill_workspaces()` 为旧用户建个人 workspace，回填 Devbox/Session，并保证现有 owner membership。
-- DVR 使用独立 `recording_chunk(session_id, seq, direction, data, created_at)` 保存双向原始字节；旧 `output_chunk` 继续兼容历史 PTY 文本。
+- DVR 使用 `recording_frame(session_id, pty_instance_id, seq, kind, data, payload_hash, elapsed, timestamp, ...)` 保存 PTY bytes 或 canonical event，并以 `recording_checkpoint` 加速 replay；旧 `output_chunk` 继续兼容历史 PTY 文本。
 
 ### 2.1a Microsoft identity 与 workspace onboarding
 
@@ -94,7 +94,7 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
 - members 端点支持列出、添加已有用户、改角色、删除；admin/owner 权限与“至少保留一个 owner”均在服务端校验。
 - workspace invitation 端点支持创建、列表、撤销、POST preview 与原子 accept；邀请按 email 绑定、单次、过期，重新签发撤销旧链接，accept 对并发双击幂等。
 - `GET /api/devboxes` 聚合当前用户所有 workspace；创建 Devbox 必须指定可管理的 workspace。Agent、Session、recording 与 project 路由都从 workspace membership 推导权限。
-- connector bearer 仅作用于自己的 Devbox；动态 agent 热注册与 `runtime_capabilities_json` 上报不依赖 UI/服务端 runtime 分支。
+- connector bearer 仅作用于自己的 Devbox；动态 agent 热注册、opaque capability、path-free project 与 sanitized skill inventory 上报都不依赖 UI/服务端 runtime 分支。`POST /api/devboxes/{id}/projects` 不删除仍被 skill 引用的 project；`POST /api/devboxes/{id}/skills` 最多接受 256 条且拒绝 path。
 
 **(c) Session 创建与编排**
 
@@ -117,7 +117,7 @@ venv Python 的 isolated mode（`-I -m connector.cli`）启动，因此不会从
 普通 `deepbox connect` 绝不触碰 app 目录。
 
 `connector/cli.py` 是用户命令 dispatcher：`connect` 去掉命令名后转给
-`client.main(argv)`；`doctor` / `status` 转成原有 flag；`project` 保留子命令 argv。
+`client.main(argv)`；`doctor` / `status` 转成原有 flag；`project` 与 `skill` 保留子命令 argv。
 installer 仍写出旧 `deepbox-connect.cmd` / `.sh`，但它只委托 `deepbox connect`，从而兼容
 旧快捷方式而不再把安装与连接耦合。Windows installer 仅在安装/升级刷新前停止本 venv 的
 `-m connector` / `-m connector.cli` 进程树；连接路径不会调用该逻辑。
@@ -148,21 +148,15 @@ Protocol v3 的输出身份是 `(session_id, pty_instance_id, seq)`：
 `open_spool(server_url, token)` 只在真实 CLI 模式注入；普通 `Connector(...)` / `SessionSupervisor(...)` 构造默认使用内存 spool，不会在单测或库调用时创建用户文件。server 仍只持有终端记录和非 secret 元数据，绝不接触模型或本地 API key。
 
 ### 3.1 `client.py` — 主循环（组合 supervisor + transport）
-1. `GET /api/me`（带 Bearer token）→ 拿到要跑的 agent 名单（runtime/cwd/launch_cmd）。
-2. `probe_runtimes()`：用 `shutil.which()` 探测本机装了哪些 CLI（claude/copilot/codex），
-   `POST /runtimes` 上报（让 UI 显示 capabilities）。
-3. （all-in-one）每个 WS 连接新建一对 `LoopbackChannel`，`supervisor.attach()`，开 drain / control 两个 task；双进程下改由 `SupervisorService.serve()` 接受 transport 连接，`run_transport()` 连本地 sessiond。
-4. 开 `/ws/devbox` WS（header 带 Bearer token），收 `hello`，交给 `TransportSession.run(ws)`。
-5. server 帧经 transport→channel→`supervisor.handle_control()`；PTY 输出经
-   `supervisor.emit()`→`pending`→`drain_to()`→transport→WS。
-6. 断线自动重连（外层 `while True` + 3s 退避）。WS 断开时 `supervisor.detach()`，
-   PTY 继续跑、output 继续进 `pending`，重连后新 transport 按序补发并 resume 同一 PTY。
+1. `GET /api/me`（带 Bearer token）取得 authoritative agent 与 path-free project directory，并校验 protocol version。
+2. 从 connector-state `state.db` 上报 projects 与 sanitized skills；`probe_runtimes()` 遍历 registry 并 `POST /runtimes` 上报 display-safe capabilities。
+3. 启动 2 秒 inventory watcher；外部 `deepbox project/skill` mutation 改变 signature 后重报两个 inventory。
+4. （all-in-one）每个 WS 连接新建一对 `LoopbackChannel`，`supervisor.attach()`；双进程下由 `SupervisorService.serve()` 接受 transport 连接，`run_transport()` 连本地 sessiond。
+5. 开 `/ws/devbox` WS（Bearer token），收 `hello`，交给 `TransportSession.run(ws)`。仅 connector 将 `local_project_id` resolve 为 launch cwd。
+6. server 帧经 transport→channel→`supervisor.handle_control()`；PTY/canonical event 输出经 `supervisor.emit()`→spool→`drain_to()`→transport→WS。
+7. 断线自动退避重连；`supervisor.detach()` 不 kill PTY，重连后按 ACK cursor 从 durable spool 续传。
 
-`connector/runtimes.py` 是 runtime 单一事实来源。`RuntimeAdapter` 描述稳定 id、label、
-`base_argv`、model flag/allowlist、permission mode argv、非机密 environment 和探测提示；
-注册表内置 `mock`、`claude-code`、`copilot-cli`、`codex-cli`。`client.probe_runtimes()`
-遍历注册表并把 install/version/path/features 作为 opaque capability JSON 上报，Server/Web
-不解析 runtime-specific 字段。
+`connector/runtimes.py` 是 runtime 单一事实来源。`RuntimeAdapter` 描述稳定 id/label、argv、model 与 permission allowlist、非机密 environment、探测提示、structured/terminal surfaces，以及 personal/project skill roots；一个 family target 可映射多个 roots。注册表内置 `mock`、`claude-code`、`copilot-cli`、`codex-cli`。`runtime_probe.py` 只在 connector 本机执行 subprocess probe；executable path、原始输出和凭据不上报。
 
 `resolve_cmd(runtime, launch_cmd, model, permission_mode)`：显式 `launch_cmd` 仍优先，但只用
 `shlex.split` 拆成 argv；否则由共享 `build_command()` 构造 argv。两条路径都会拒绝空 token、
@@ -388,18 +382,12 @@ model 或 reasoning 值。
   attach frame 显式发送 `surface`。Connector 用 `session.ready.surface` 确认；找不到或无法启动时返回
   `runtime.unavailable`（含 installation/compatibility/authentication 与 available surfaces），绝不静默
   回退到 terminal。
-- Probe 可运行 adapter 声明的安全模型枚举 argv/parser；发现结果同时更新 family catalogue 与各 surface 的
-  model choices。若 CLI 没有稳定枚举接口，`models.source` 为 `catalogue` 且 `complete:false`。浏览器把发现/目录
-  模型渲染为建议，同时允许自定义 model；Connector 最终拒绝控制字符、shell metacharacter 和不允许 custom
-  model 的 adapter 值。只有 adapter 提供可靠的非交互 status argv 时，authentication probe 才会参与 spawn gate；
-  Copilot 仅提供交互式 `/login`，因此上报 `unknown` 而不是制造阻断启动的 false negative。
+- Probe 可运行 adapter 声明的安全模型枚举 argv/parser；发现结果同时更新 family catalogue 与各 surface 的 model choices。live discovery 为空时使用 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；runtime 结果标记 `complete/runtime`。浏览器同时接受 bare capability array 与 `{runtimes:[...]}` wrapper，model control 总提供 `Runtime default`，只有 descriptor 的 `allow_custom=true` 才允许输入目录外 ID。Connector 最终拒绝控制字符、shell metacharacter 和不允许 custom model 的 adapter 值。只有 adapter 提供可靠非交互 status argv 时 authentication probe 才参与 spawn gate；Copilot 因此上报 `unknown`，不制造 false negative。
 - Claude structured 暴露 model、effort 和 file controls；Copilot structured 暴露 model、reasoning
   effort（`low|medium|high|xhigh|max`）和 attachment controls。当前 generic control kind 只有 `select` 与 `file`；
   descriptor 携带 key、
   label、scope、choices/default 或文件数量/总字节上限，浏览器不按 runtime ID 分支。
-- Connector 按 adapter allowlist 验证每个 option；session-scope select 在首个 turn 后锁定，per-turn
-  select 每轮应用。agent `runtime_config.permission_mode` 同样先按 adapter allowlist 清洗，再进入每轮实际 argv。
-  `session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。
+- Connector 按 adapter allowlist 验证每个 option；session-scope select 在 session 已有配置或首个 chat item 后锁定，per-turn select 每轮应用。agent `runtime_config.permission_mode` 同样先按 adapter allowlist 清洗，再进入每轮实际 argv。`session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。`New chat` 在已有历史时确认，发送需 operator + keyboard lease 的 `terminate`，创建空 persisted session 并重新开放 controls；detach/close 不终止本机 session。
 
 ### 9.4 文件输入
 
@@ -412,9 +400,7 @@ model 或 reasoning 值。
 
 ### 9.5 Browser chat、tab re-attach 与 restore
 
-- `web/ui.js` 先用 family ID（并兼容旧 adapter ID）定位 capability，再由 default surface 决定 chat 或
-  terminal；`web/chat.js` 独立负责事件解析、reducer、generic control normalization/options 和 semantic
-  HTML；`web/app.js` 负责 DOM/WS/FileReader 接线。
+- `web/ui.js` 先用 family ID（并兼容旧 adapter ID）定位 capability，再由 default surface 决定 chat 或 terminal；它也提供 model fallback/lock、LocalProject options 与 project/skill command builders。`web/chat.js` 独立负责事件解析、reducer、generic control normalization/options 和 semantic HTML；`web/app.js` 负责 DOM/WS/FileReader 接线。Add-agent 每次打开刷新 runtime/project inventory，可选择 LocalProject；**Add a local project** 仅显示 copyable `deepbox project add ...`，不浏览 Server filesystem。Skills modal 只展示 path-free inventory 与 connector-local commands。
 - 打开 structured agent 时，在第一帧到达前就进入 chat surface，避免短暂落入 xterm 后停在
   “resumed live session”。lazy mount 使用 per-view epoch 丢弃旧 agent/view 的延迟结果，并用 single-flight 合并 cold-start
   event burst。live `event` 与 restore `event` 走同一个 reducer。
@@ -428,20 +414,10 @@ model 或 reasoning 值。
 
 ### 9.6 LocalProject 持久化与隐私边界
 
-- `connector/local_store.py` 的 `LocalProjectStore` 使用 `~/.deepbox/state.db`，表为
-  `local_project(id, name, path, created_at, updated_at)`。SQLite 开启 WAL、`synchronous=NORMAL`、
-  `busy_timeout` 和 `foreign_keys`；跨进程 mutation 用相邻 `.lock` 文件串行化。新目录/数据库分别尝试
-  `0700`/`0600` 权限。`add()` 只接受已存在的目录、存为绝对路径，展开 `~` 但不展开路径中合法的环境变量语法；
-  canonical path 重复添加会复用原 ID，显式名称只更新 metadata。
-- `deepbox project add|remove|list|sync`（由 `connector.cli` 委托）与常驻 connector 共用该 store。每次连接和 mutation 后，
-  `Connector.report_projects()` 向 `/api/devboxes/{id}/projects` 只发送 `public_projects()` 的
-  `{id,name}`（以及 legacy migration 的 `{agent_id,local_project_id}`）；绝不发送 `path`。
-- Server 的 `DevboxProject` 只保存 path-free metadata。Agent 通过 `local_project_id` 外键引用 project，删除
-  project 时外键置空；authoritative report 也会清理已消失 project 和悬空引用，再推送新的 agent directory。
-  创建 agent 时 Server 校验 project 属于同一 devbox，`runtime_config` 必须是对象且不超过 16 KiB。
-- `resolve_agents()` 在 connector 本机把 `local_project_id` 解析成 `cwd`。缺失 ID/目录产生 `project_error`，
-  supervisor 的 attach 返回结构化 `runtime.unavailable(code=project_unavailable)`。旧 directory 中的 `cwd`
-  会被导入为 LocalProject；首次成功 report 提交 migration 并清空 Server 上所有 legacy absolute cwd。
+- `connector/local_store.py` 的 `LocalProjectStore` 使用 connector-state `state.db`：Windows root 为 `%LOCALAPPDATA%/deepbox`，macOS/Linux 为 `${XDG_STATE_HOME:-~/.local/state}/deepbox`。SQLite 开启 WAL、`synchronous=NORMAL`、5 秒 `busy_timeout`；跨进程 mutation 用相邻 `.lock` 文件串行化，Unix 目录/DB 尝试 `0700`/`0600`。`local_project(id,name,path,created_at,updated_at)` 的 path 只在本机 canonicalize/去重。
+- `deepbox project add|remove|list|sync` 与常驻 connector 共享 store。`report_projects()` 只发送 `{id,name}` 与 legacy migration mapping，绝不发送 path；watcher 检测外部 mutation 后自动同步。
+- Server 的 `DevboxProject` 只保存 path-free metadata。创建 agent 时校验 project 属于同一 devbox，`runtime_config` 必须是对象且不超过 16 KiB。local store 与 Server reconciliation 都拒绝删除仍被 skill 引用的 project；否则消失 project 的 agent FK 置空。
+- `resolve_agents()` 仅在 connector 本机把 `local_project_id` 解析为 `cwd`。缺失 ID/目录产生 `project_error`，attach 返回 `runtime.unavailable(code=project_unavailable)`。旧 directory `cwd` 只导入一次；成功 report 后 Server 清空 legacy absolute cwd。`--project` 可用 ID、唯一 case-insensitive name、exact normalized path；无值等价 `--project .` 并以 `commonpath` 最长包含项目解析。
 
 ### 9.7 Connector WebSocket 稳定性
 
@@ -450,13 +426,20 @@ model 或 reasoning 值。
 但不会掩盖断线；外层 connector loop 仍在 abnormal close 后退避重连并从 durable spool 续传。
 生产 B1 App Service 的 SNAT 上限仍是平台容量风险，参数硬化不是扩容的替代品。
 
-### 9.8 当前限制与验证
+### 9.8 用户 Skills
+
+- `connector/skills.py` 以 `yaml.safe_load` 解析 UTF-8 `SKILL.md` frontmatter；`name` 必须 lower-kebab-case 且等于目录 basename，`description` 必须为 string。tree 只接受 regular files，拒绝 traversal、symlink/junction/reparse 与 read-time mutation，上限 256 files / 10 MiB；scripts 只产生 `contains_scripts=true`，Deepbox 不执行。
+- scope 为 `personal` 或 LocalProject ID。Adapter target 是 family ID，经 `destinations()` 展开一个或多个 personal/project roots；destination key 用 `family` / `family#index` 消歧。重发现 roots 时 merge 有效旧 bindings，不产生 orphan。
+- source-of-truth 为 `<connector-state-root>/skills/store/<digest>/<name>/`。install 在 copy 前后两次 scan/hash，再 staged atomic replace 全部 destinations；失败 rollback。`list`/`inspect` 先验 store integrity，再检查 bindings，返回 `installed|drifted|missing`；drift 下 install/remove 需 `--force`，最后引用移除后 GC digest store。
+- `local_skill` 保存本机 source/store/binding paths。Server 仅接收 `{id,name,description,digest,scope,project_id,targets,contains_scripts,status}`，最多 256 项且从不接收 path。
+
+### 9.9 当前限制与验证
 
 - Claude structured 默认使用 `--permission-mode acceptEdits`，其他声明模式映射到对应 `--permission-mode`，仅
   `bypassPermissions` 使用 `--dangerously-skip-permissions`；Copilot structured 使用 `--allow-all-tools`。workspace
   role/keyboard lease 仍限制谁能提交输入，但这两个 adapter 当前不提供逐 tool 的 runtime approval。
 - Copilot 每 turn 新进程，因此不保留跨 turn context；Claude 的 context 跟随 live structured process。
 - Canonical event 不转发 raw provider payload、chain-of-thought、connector token、模型凭证或工作站路径。
-- `tests/test_connector_runtimes.py`、`tests/test_copilot_session.py`、
-  `tests/test_connector_transport.py`、`tests/test_server_recording.py` 覆盖 adapter/options/附件/restore/WS；
-  `web/chat.test.js` 与 `web/ui.test.js` 覆盖 JSONL 容错、reducer、controls、render 与 surface selection。
+- `tests/test_connector_runtimes.py`、`tests/test_runtime_probe.py`、`tests/test_copilot_session.py`、`tests/test_connector_transport.py`、`tests/test_server_recording.py` 覆盖 adapter/options/model fallback/附件/restore/WS。
+- `tests/test_skills.py`、`tests/test_devbox_skills.py`、`tests/test_project_watcher.py` 覆盖 SKILL validation、atomic install/rollback/drift/GC、sanitized report、project-retention guard 与 watcher。
+- `web/chat.test.js` 与 `web/ui.test.js` 覆盖 JSONL 容错、reducer、controls/model lock、command quoting、render 与 surface selection；`tests/test_installer_scripts.py` 固定 PyYAML connector dependency。

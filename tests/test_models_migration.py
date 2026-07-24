@@ -181,6 +181,11 @@ class LegacyBackfillTests(unittest.TestCase):
                 }
                 self.assertIn("local_project_id", agent_cols)
                 self.assertIn("runtime_config", agent_cols)
+                devbox_cols = {
+                    row[1] for row in db.execute(
+                        models.text("PRAGMA table_info(devbox)"))
+                }
+                self.assertIn("skills", devbox_cols)
                 project_table = db.execute(models.text(
                     "SELECT name FROM sqlite_master "
                     "WHERE type='table' AND name='devbox_project'"

@@ -38,6 +38,20 @@ def test_surface_lookup_never_falls_back_to_another_surface():
         runtimes.get_for_surface("codex-cli", "structured")
 
 
+def test_adapter_declares_personal_and_project_skill_roots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    claude = runtimes.get("claude-code")
+    personal = {path.replace("\\", "/") for path in claude.skill_roots()}
+    project = {path.replace("\\", "/") for path in claude.skill_roots(str(tmp_path / "repo"))}
+    assert any(path.endswith("/.claude/skills") for path in personal)
+    assert any(path.endswith("/.agents/skills") for path in personal)
+    assert any(path.endswith("/.claude/skills") for path in project)
+    assert any(path.endswith("/.agents/skills") for path in project)
+    assert claude.capabilities(installed=True)["features"]["skills"] is True
+    assert runtimes.get("mock").skill_roots() == ()
+
+
 def test_register_rejects_duplicate():
     existing = runtimes.get("claude-code")
     with pytest.raises(ValueError):

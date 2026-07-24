@@ -80,6 +80,7 @@ class Devbox(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
     last_seen_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    skills: Mapped[list | None] = mapped_column(JSON, nullable=True)
     workspace_id: Mapped[str | None] = mapped_column(
         ForeignKey("workspace.id", ondelete="SET NULL"), nullable=True)
 
@@ -462,6 +463,8 @@ def _migrate(engine) -> None:
             stmts.append(
                 "ALTER TABLE devbox ADD COLUMN workspace_id VARCHAR "
                 "REFERENCES workspace(id) ON DELETE SET NULL")
+        if "skills" not in devbox_cols:
+            stmts.append("ALTER TABLE devbox ADD COLUMN skills JSON")
     if "agent" in inspector.get_table_names():
         agent_cols = {c["name"] for c in inspector.get_columns("agent")}
         if "local_project_id" not in agent_cols:
